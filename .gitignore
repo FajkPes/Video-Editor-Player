@@ -1,0 +1,13 @@
+build/
+release/
+downloads/
+test-artifacts/
+validation-*/
+vendor/*.dll
+vendor/*.exe
+vp_settings.json
+*.obj
+*.pdb
+*.ilk
+*.rar
+.claude/
