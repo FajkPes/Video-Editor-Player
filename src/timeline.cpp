@@ -81,6 +81,7 @@ void Timeline::setMedia(double duration, const std::vector<std::string>& trackNa
     selected_ = -1;
     selectedRow_ = -1;
     selectedText_ = -1;
+    scrollY_ = 0;
 }
 
 void Timeline::clear() {
@@ -189,15 +190,14 @@ std::string assTime(double seconds) {
 // A line break typed into the box has to reach ASS as its own escape, and a
 // brace would otherwise start an override block.
 std::string assText(const std::wstring& text) {
-    std::string out;
+    std::wstring escaped;
     for (wchar_t c : text) {
-        if (c == L'\n') { out += "\\N"; continue; }
+        if (c == L'\n') { escaped += L"\\N"; continue; }
         if (c == L'\r') continue;
-        if (c == L'{' || c == L'}') { out += ' '; continue; }
-        wchar_t one[2] = {c, 0};
-        out += toUtf8(one);
+        if (c == L'{' || c == L'}') { escaped += L' '; continue; }
+        escaped += c;
     }
-    return out;
+    return toUtf8(escaped); // Keep UTF-16 surrogate pairs together (emoji).
 }
 
 }  // namespace
@@ -329,14 +329,14 @@ std::vector<Segment> Timeline::keptSegments() const {
         Segment clipped = s;
         clipped.start = std::max(s.start, lo);
         clipped.end = std::min(s.end, hi);
-        if (clipped.end - clipped.start > 0.02) out.push_back(clipped);
+        if (clipped.end - clipped.start > 1e-9) out.push_back(clipped);
     }
     return out;
 }
 
 double Timeline::keptDuration() const {
     double total = 0.0;
-    for (const Segment& s : keptSegments()) total += s.end - s.start;
+    for (const Segment& s : keptSegments()) total += (s.end - s.start) / clipSpeed(s.video);
     return total;
 }
 
@@ -383,6 +383,8 @@ std::wstring Timeline::statusLine() const {
 // ------------------------------------------------------------------ drawing
 
 void Timeline::paint(HDC dc, double playhead, POINT mouse, const theme::Fonts* fonts) const {
+    ScopedDc drawing(dc);
+    IntersectClipRect(dc, bounds_.left, bounds_.top, bounds_.right, bounds_.bottom);
     fill(dc, bounds_, kBack);
     if (duration_ <= 0.0) {
         text(dc, bounds_, tr(L"open a file and its tracks appear here"), kTextDim,
@@ -390,7 +392,9 @@ void Timeline::paint(HDC dc, double playhead, POINT mouse, const theme::Fonts* f
         return;
     }
 
-    paintRuler(dc, fonts);
+    const int bodyState = SaveDC(dc);
+    IntersectClipRect(dc, bounds_.left, bounds_.top + kHeadHeight,
+                      bounds_.right, bounds_.bottom);
     paintTextRow(dc, mouse, fonts);
     for (int row = 0; row < rowCount(); ++row) paintRow(dc, row, mouse, fonts);
 
@@ -415,6 +419,8 @@ void Timeline::paint(HDC dc, double playhead, POINT mouse, const theme::Fonts* f
     };
     shade(bodyLeft(), lo);
     shade(hi, bodyRight());
+    RestoreDC(dc, bodyState);
+    paintRuler(dc, fonts);
 
     // The playhead, over everything.
     const int head = xFor(playhead);
@@ -532,7 +538,7 @@ void Timeline::paintRow(HDC dc, int row, POINT mouse, const theme::Fonts* fonts)
         // The name the file gives it, so a row and its panel row agree even
         // when they are not handed over in the same order.
         const std::string& given = trackNames_[static_cast<size_t>(trackForRow(row))];
-        label.assign(given.begin(), given.end());
+        label = fromUtf8(given);
     } else {
         wchar_t buf[64];
         _snwprintf_s(buf, _TRUNCATE, L"A%d", row);
@@ -591,9 +597,9 @@ void Timeline::paintRow(HDC dc, int row, POINT mouse, const theme::Fonts* fonts)
         if (row == 0) {
             // The film strip, clipped to this piece so a dropped stretch does
             // not carry pictures that will not be in the output.
-            HRGN clip = CreateRectRgn(piece.left, piece.top + 1, piece.right,
-                                      piece.bottom - 1);
-            SelectClipRgn(dc, clip);
+            const int saved = SaveDC(dc);
+            IntersectClipRect(dc, piece.left, piece.top + 1, piece.right,
+                              piece.bottom - 1);
             for (const Thumb& thumb : thumbs_) {
                 if (thumb.at < s.start || thumb.at > s.end || !thumb.bitmap) continue;
                 const int x = xFor(thumb.at) - kThumbWidth / 2;
@@ -606,8 +612,7 @@ void Timeline::paintRow(HDC dc, int row, POINT mouse, const theme::Fonts* fonts)
                 SelectObject(mem, old);
                 DeleteDC(mem);
             }
-            SelectClipRgn(dc, nullptr);
-            DeleteObject(clip);
+            RestoreDC(dc, saved);
         } else if (track >= 0 && static_cast<size_t>(track) < waves_.size() &&
                    !waves_[static_cast<size_t>(track)].peaks.empty()) {
             const Waveform& wave = waves_[static_cast<size_t>(track)];
@@ -736,9 +741,10 @@ void Timeline::paintFadeHandles(HDC dc, int row, bool rowHot,
             above.push_back({fromX, roof});
             if (HRGN rgn = CreatePolygonRgn(above.data(), static_cast<int>(above.size()),
                                             WINDING)) {
-                SelectClipRgn(dc, rgn);
+                const int saved = SaveDC(dc);
+                ExtSelectClipRgn(dc, rgn, RGN_AND);
                 blendFill(dc, band, RGB(0x08, 0x09, 0x0c), 170);
-                SelectClipRgn(dc, nullptr);
+                RestoreDC(dc, saved);
                 DeleteObject(rgn);
             }
 
@@ -748,9 +754,10 @@ void Timeline::paintFadeHandles(HDC dc, int row, bool rowHot,
             below.push_back({fromX, bottom});
             if (HRGN rgn = CreatePolygonRgn(below.data(), static_cast<int>(below.size()),
                                             WINDING)) {
-                SelectClipRgn(dc, rgn);
+                const int saved = SaveDC(dc);
+                ExtSelectClipRgn(dc, rgn, RGN_AND);
                 blendFill(dc, band, kAccent, 46);
-                SelectClipRgn(dc, nullptr);
+                RestoreDC(dc, saved);
                 DeleteObject(rgn);
             }
 
@@ -1008,6 +1015,7 @@ void Timeline::fromJson(const json::Value& v) {
 // -------------------------------------------------------------- interaction
 
 bool Timeline::inTextRow(POINT p) const {
+    if (!PtInRect(&bounds_, p) || p.y < bounds_.top + kHeadHeight) return false;
     return p.y >= textTop() && p.y < textTop() + kTextRow;
 }
 
@@ -1022,6 +1030,7 @@ int Timeline::textAt(POINT p) const {
 }
 
 int Timeline::rowAt(POINT p) const {
+    if (!PtInRect(&bounds_, p) || p.y < bounds_.top + kHeadHeight) return -1;
     for (int row = 0; row < rowCount(); ++row) {
         const int top = rowTop(row);
         if (p.y >= top && p.y < top + rowHeight(row)) return row;
@@ -1036,7 +1045,7 @@ bool Timeline::onDown(POINT p, bool alt, bool* seeked, double* seekTo) {
     // The ruler is for scrubbing and nothing else, so a drag there never has to
     // guess whether a segment was meant. It ends where the caption row starts:
     // before that line was drawn here, this test claimed the caption row too.
-    if (p.y < textTop()) {
+    if (p.y < bounds_.top + kHeadHeight) {
         drag_ = Drag::Head;
         *seeked = true;
         *seekTo = timeAt(p.x);

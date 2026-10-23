@@ -78,16 +78,33 @@ int runHidden(const std::wstring& commandLine, std::string* output, DWORD timeou
     std::string collected;
     char buffer[4096];
     DWORD got = 0;
-    while (ReadFile(readEnd, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
+    const ULONGLONG began = GetTickCount64();
+    bool timedOut = false;
+    for (;;) {
+        if (timeoutMs != INFINITE && GetTickCount64() - began >= timeoutMs) {
+            TerminateProcess(pi.hProcess, 1);
+            timedOut = true;
+            break;
+        }
+        DWORD available = 0;
+        if (!PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr)) break;
+        if (!available) {
+            if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
+                if (!PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) || !available) break;
+            }
+            continue;
+        }
+        if (!ReadFile(readEnd, buffer, std::min<DWORD>(sizeof(buffer), available), &got, nullptr) || !got) break;
         if (output) collected.append(buffer, got);
     }
     CloseHandle(readEnd);
 
-    WaitForSingleObject(pi.hProcess, timeoutMs);
+    WaitForSingleObject(pi.hProcess, timedOut ? INFINITE : timeoutMs);
     DWORD code = 0;
     GetExitCodeProcess(pi.hProcess, &code);
     if (code == STILL_ACTIVE) {
         TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, INFINITE);
         code = 1;
     }
     CloseHandle(pi.hThread);

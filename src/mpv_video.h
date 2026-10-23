@@ -62,6 +62,8 @@ public:
     double duration();
     int width();
     int height();
+    int displayWidth();
+    int displayHeight();
     double fps();
     std::string hwdec();
 

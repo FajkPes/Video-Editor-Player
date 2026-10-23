@@ -4,6 +4,7 @@
 #include "audio_engine.h"
 #include "audio_dsp.h"
 #include "audio_stretch.h"
+#include "timeline.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX   // windows.h defines min and max as macros
@@ -42,10 +43,12 @@ inline int64_t hnsToFrames(int64_t hns) {
 // where its timestamp says it belongs instead of shifting everything after it.
 class TrackBuffer {
 public:
+    std::atomic<bool> finished{false};
     void reset(int64_t startFrame) {
         std::lock_guard<std::mutex> lock(mutex_);
         data_.assign(static_cast<size_t>(kRingSeconds) * kMixRate * kMixChannels, 0.0f);
         lo_ = hi_ = startFrame;
+        finished.store(false,std::memory_order_relaxed);
     }
 
     void write(int64_t frame, const float* samples, int64_t frames) {
@@ -194,6 +197,10 @@ struct AudioEngine::Impl {
     // Frames the mixer has handed to the device. Everything visible outside
     // this class is derived from it, which is what makes audio the master.
     std::atomic<int64_t> playPos{0};
+    std::atomic<double> outputPosition{0.0}; // source seconds actually sent, excluding stretch lookahead
+    std::atomic<double> queuedSeconds{0.0};
+    std::mutex renderMutex;
+    std::shared_ptr<const std::vector<Segment>> clipEdits;
     std::vector<float> mixBuffer;
 
     // Speed, and the scratch the mixer reads into when it is not 1.0. Both are

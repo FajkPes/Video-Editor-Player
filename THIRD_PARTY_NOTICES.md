@@ -19,12 +19,12 @@ The downloadable Windows package uses the following third-party projects:
 
 ### FFmpeg and FFprobe
 
-- Version: `N-126313-g1ae4048218-20260829`
-- Variant: BtbN Windows x86-64 GPL static build
-- FFmpeg SHA-256: `773ED53B6287FE7B7224818786C42B9B0EB734F8B2692E77DF688B8910407EDA`
-- FFprobe SHA-256: `513D533A883FEBB1AA94893C00092283F28ACD127D4BFA8C35BB3B82343B7324`
-- Exact FFmpeg source: <https://github.com/FFmpeg/FFmpeg/tree/1ae4048218>
-- Reproducible build scripts and downloads: <https://github.com/BtbN/FFmpeg-Builds>
+- Version: `8.1.2-full_build-www.gyan.dev` (verified with `-version`)
+- Windows x64 GPL static full build by gyan.dev
+- FFmpeg SHA-256: `AD8F211BC894755E0061C55AB280AE00E8D3D4F15A8CC4372B24CFA247B5942E`
+- FFprobe SHA-256: `9DF3B0B5275E830961DF6D94E1F7A71121A7ABD5FF708E9FEC8A0B6084A55015`
+- Source: <https://github.com/FFmpeg/FFmpeg/tree/n8.1.2>
+- Build distribution: <https://www.gyan.dev/ffmpeg/builds/>
 - License file: `third_party/licenses/FFmpeg-GPL-3.0.txt`
 
 These notices apply only to the third-party components. The original Video Editor Player source was created by FajkPes and is released under GPL-3.0-or-later so the complete package can be redistributed consistently with these dependencies.

@@ -42,8 +42,9 @@ std::string narrow(const std::wstring& text) {
     const int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1,
                                          nullptr, 0, nullptr, nullptr);
     if (need <= 1) return {};
-    std::string out(static_cast<size_t>(need - 1), ' ');
+    std::string out(static_cast<size_t>(need), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, &out[0], need, nullptr, nullptr);
+    out.resize(static_cast<size_t>(need - 1));
     return out;
 }
 
@@ -87,7 +88,9 @@ bool MpvVideo::start(HWND host, std::string* error) {
     mpv_command_ = reinterpret_cast<fn_command>(GetProcAddress(library_, "mpv_command"));
     mpv_free_ = reinterpret_cast<fn_free>(GetProcAddress(library_, "mpv_free"));
 
-    if (!mpv_create_ || !mpv_initialize_ || !mpv_set_option_string_ || !mpv_command_) {
+    if (!mpv_create_ || !mpv_initialize_ || !mpv_terminate_ ||
+        !mpv_set_option_string_ || !mpv_set_property_string_ || !mpv_get_property_ ||
+        !mpv_free_ || !mpv_command_) {
         if (error) *error = "libmpv-2.dll is not the library this player expects";
         return false;
     }
@@ -112,6 +115,8 @@ bool MpvVideo::start(HWND host, std::string* error) {
     mpv_set_option_string_(handle_, "osc", "no");
     mpv_set_option_string_(handle_, "input-default-bindings", "no");
     mpv_set_option_string_(handle_, "input-vo-keyboard", "no");
+    mpv_set_option_string_(handle_, "auto-window-resize", "no");
+    mpv_set_option_string_(handle_, "keepaspect-window", "no");
     mpv_set_option_string_(handle_, "idle", "yes");
 
     // Not display-resample. In the display-locked modes mpv changes the speed
@@ -148,7 +153,7 @@ void MpvVideo::seek(double seconds) {
     if (!handle_) return;
     char at[32];
     _snprintf_s(at, sizeof(at), _TRUNCATE, "%.3f", seconds);
-    const char* args[] = {"seek", at, "absolute", "exact", nullptr};
+    const char* args[] = {"seek", at, "absolute+exact", nullptr};
     mpv_command_(handle_, args);
     lastCorrection_ = 0.0;
 }
@@ -227,6 +232,14 @@ double MpvVideo::videoPosition() { return numberProperty("time-pos"); }
 double MpvVideo::duration() { return numberProperty("duration"); }
 int MpvVideo::width() { return static_cast<int>(numberProperty("width")); }
 int MpvVideo::height() { return static_cast<int>(numberProperty("height")); }
+int MpvVideo::displayWidth() {
+    const int w = static_cast<int>(numberProperty("video-out-params/dw"));
+    return w > 0 ? w : width();
+}
+int MpvVideo::displayHeight() {
+    const int h = static_cast<int>(numberProperty("video-out-params/dh"));
+    return h > 0 ? h : height();
+}
 double MpvVideo::fps() { return numberProperty("container-fps"); }
 std::string MpvVideo::hwdec() { return stringProperty("hwdec-current"); }
 

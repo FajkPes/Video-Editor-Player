@@ -54,6 +54,7 @@ private:
 
     Settings work_;                 // edited here, copied back only on Ulozit
     bool changed_ = false;
+    bool closed_ = false;
 
     Hit languageChip_, languageFolder_;
     std::vector<LanguageInfo> languages_;
@@ -350,7 +351,7 @@ LRESULT CALLBACK SettingsWindow::proc(HWND hwnd, UINT message, WPARAM w, LPARAM 
             if (w == VK_ESCAPE) DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
-            PostQuitMessage(0);
+            if (self) self->closed_ = true;
             return 0;
         default: break;
     }
@@ -398,11 +399,12 @@ bool SettingsWindow::run(HWND owner, HINSTANCE instance) {
     EnableWindow(owner, FALSE);
     ShowWindow(window_, SW_SHOW);
 
-    MSG message;
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+    MSG message{};
+    while (!closed_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
 
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);

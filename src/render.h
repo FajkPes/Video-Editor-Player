@@ -49,6 +49,7 @@ struct RenderJob {
     double duration = 0.0;
     std::vector<Segment> segments;      // kept stretches, in order
     std::vector<RowFades> fades;        // row 0 picture, then one per track
+    double fadeStart = 0.0, fadeEnd = -1.0; // source time, before cuts and speed
     std::vector<RenderTrack> tracks;
     int contrast = 0, brightness = 0, saturation = 0, gamma = 0, hue = 0;
     int sharpen = 0, denoise = 0;

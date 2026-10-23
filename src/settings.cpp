@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -19,8 +20,9 @@ std::string toUtf8(const std::wstring& s) {
     const int need = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr,
                                          nullptr);
     if (need <= 1) return {};
-    std::string out(static_cast<size_t>(need - 1), '\0');
+    std::string out(static_cast<size_t>(need), '\0');
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, &out[0], need, nullptr, nullptr);
+    out.resize(need - 1);
     return out;
 }
 
@@ -28,8 +30,9 @@ std::wstring fromUtf8(const std::string& s) {
     if (s.empty()) return {};
     const int need = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (need <= 1) return {};
-    std::wstring out(static_cast<size_t>(need - 1), L'\0');
+    std::wstring out(static_cast<size_t>(need), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &out[0], need);
+    out.resize(need - 1);
     return out;
 }
 
@@ -113,7 +116,7 @@ json::Value writeVideoPreset(const VideoPreset& p) {
 RenderPreset readRenderPreset(const json::Value& v) {
     RenderPreset p;
     p.name = v["name"].asString();
-    p.encoder = v["encoder"].asInt();
+    p.encoder = std::max(0, std::min(4, v["encoder"].asInt()));
     p.bitrate = v["bitrate"].asInt(30000);
     p.useQuality = v["useQuality"].asBool();
     p.quality = v["quality"].asInt(23);
@@ -124,6 +127,9 @@ RenderPreset readRenderPreset(const json::Value& v) {
     p.keepPitch = v["keepPitch"].asBool(true);
     p.hardwareDecode = v["hardwareDecode"].asBool(true);
     p.halfSize = v["halfSize"].asBool();
+    p.orientation = std::max(0, std::min(2, v["orientation"].asInt()));
+    p.outWidth = std::max(0, std::min(16384, v["outWidth"].asInt()));
+    p.outHeight = std::max(0, std::min(16384, v["outHeight"].asInt()));
     return p;
 }
 
@@ -141,6 +147,9 @@ json::Value writeRenderPreset(const RenderPreset& p) {
     v.set("keepPitch", p.keepPitch);
     v.set("hardwareDecode", p.hardwareDecode);
     v.set("halfSize", p.halfSize);
+    v.set("orientation", p.orientation);
+    v.set("outWidth", p.outWidth);
+    v.set("outHeight", p.outHeight);
     return v;
 }
 
@@ -255,8 +264,10 @@ void Settings::save() const {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) return;
         out << root.dump(2) << "\n";
+        out.close();
+        if (!out) { DeleteFileW(temp.c_str()); return; }
     }
-    MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING);
+    MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 void Settings::rememberPositionFor(const std::wstring& path, double seconds) {

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -31,6 +32,7 @@
 #include "media_tools.h"
 #include "mpv_video.h"
 #include "render.h"
+#include "picture_filters.h"
 #include "settings.h"
 #include "settings_window.h"
 #include "timeline.h"
@@ -51,6 +53,7 @@ constexpr int kPanelWidth  = 480;
 // too narrow to hold them side by side.
 constexpr int kTransportOne = 66;
 constexpr int kTransportTwo = 104;
+constexpr int kTransportThree = 140;
 constexpr int kTrackRow    = 56;
 constexpr int kTrackOpen   = 56 + 100;   // a row with its equaliser showing
 constexpr int kAdjustRow   = 26;
@@ -61,7 +64,7 @@ constexpr int kEditorBar   = 104;
 
 // Everything the single-row transport needs, so the layout can ask whether it
 // fits before deciding to use two rows.
-constexpr int kOneRowNeeds = 1290;
+constexpr int kOneRowNeeds = 1600;
 
 std::wstring formatTime(double seconds, bool withTenths = false) {
     if (!(seconds >= 0.0)) seconds = 0.0;
@@ -105,13 +108,14 @@ LRESULT CALLBACK videoHostProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         case WM_RBUTTONDOWN:
         case WM_MOUSEMOVE: {
             POINT at{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-            MapWindowPoints(hwnd, GetParent(hwnd), &at, 1);
-            return SendMessageW(GetParent(hwnd), message, w,
+            HWND root = GetAncestor(hwnd, GA_ROOT);
+            MapWindowPoints(hwnd, root, &at, 1);
+            return SendMessageW(root, message, w,
                                 MAKELPARAM(at.x, at.y));
         }
         case WM_MOUSEWHEEL:
             // The wheel already speaks in screen coordinates.
-            return SendMessageW(GetParent(hwnd), message, w, l);
+            return SendMessageW(GetAncestor(hwnd, GA_ROOT), message, w, l);
         default:
             return DefWindowProcW(hwnd, message, w, l);
     }
@@ -138,55 +142,6 @@ const double kSpeeds[] = {0.1,  0.25, 0.5,  0.75, 0.9,  1.0,  1.1,  1.25,
 const wchar_t* const kFitNames[] = {L"Fit", L"Fill", L"Original"};
 const float kTargets[] = {-23.0f, -18.0f, -16.0f, -14.0f, -11.0f};
 
-const wchar_t* const kSharpenShader =
-    L"//!HOOK OUTPUT\n"
-    L"//!BIND HOOKED\n"
-    L"//!DESC Diamond adaptive sharpen (Video Player)\n"
-    L"\n"
-    L"// Contrast-adaptive sharpening on a diamond: the centre pixel and its four\n"
-    L"// edge neighbours, five taps in one pass. The nine-tap version costs nearly\n"
-    L"// twice the samples for a difference nobody sees in motion, and this runs\n"
-    L"// at full rate on 4K on hardware that the nine-tap one made stutter.\n"
-    L"//\n"
-    L"// The weight is scaled by how much headroom the pixel has before it would\n"
-    L"// clip, which is what stops a sharpener from ringing along hard edges.\n"
-    L"\n"
-    L"#define AMOUNT %.4f\n"
-    L"\n"
-    L"vec4 hook() {\n"
-    L"    vec3 e = HOOKED_tex(HOOKED_pos).rgb;\n"
-    L"    if (AMOUNT < 0.002) return vec4(e, 1.0);\n"
-    L"\n"
-    L"    vec2 p = HOOKED_pt;\n"
-    L"    vec3 n = HOOKED_tex(HOOKED_pos + vec2(0.0, -p.y)).rgb;\n"
-    L"    vec3 s = HOOKED_tex(HOOKED_pos + vec2(0.0,  p.y)).rgb;\n"
-    L"    vec3 w = HOOKED_tex(HOOKED_pos + vec2(-p.x, 0.0)).rgb;\n"
-    L"    vec3 t = HOOKED_tex(HOOKED_pos + vec2( p.x, 0.0)).rgb;\n"
-    L"\n"
-    L"    vec3 mn = min(min(min(n, s), min(w, t)), e);\n"
-    L"    vec3 mx = max(max(max(n, s), max(w, t)), e);\n"
-    L"    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, 1e-5), 0.0, 1.0));\n"
-    L"\n"
-    L"    // The slider runs to 2, so half of it is the curve's own 0..1. Scaling\n"
-    L"    // the weight past that end is what tore the picture: the divisor below\n"
-    L"    // reaches zero at k = -0.25 and turns negative after it, and a negative\n"
-    L"    // divisor does not sharpen, it inverts. mix(11, 5) keeps k inside\n"
-    L"    // -0.2, which is the strongest setting the published curve offers and\n"
-    L"    // the strongest one that stays stable.\n"
-    L"    float a = clamp(AMOUNT * 0.5, 0.0, 1.0);\n"
-    L"    vec3 k = amp * (-1.0 / mix(11.0, 5.0, a));\n"
-    L"\n"
-    L"    vec3 sharp = (e + (n + s + w + t) * k) / (1.0 + 4.0 * k);\n"
-    L"\n"
-    L"    // The kernel itself cannot be pushed any harder without turning\n"
-    L"    // negative, so what is left is to take the difference it found\n"
-    L"    // and weigh it more. Amplifying the overshoot this way keeps the\n"
-    L"    // filter stable and still bites the way the top of the slider\n"
-    L"    // ought to.\n"
-    L"    vec3 lifted = e + (sharp - e) * 1.6;\n"
-    L"    return vec4(clamp(lifted, 0.0, 1.0), 1.0);\n"
-    L"}\n";
-
 }  // namespace
 
 // ============================================================================
@@ -195,8 +150,11 @@ class Player {
 public:
     bool create(HINSTANCE instance, const std::wstring& openThis);
     static LRESULT CALLBACK proc(HWND, UINT, WPARAM, LPARAM);
+    friend struct PlayerUiProbe;
 
 private:
+    static LRESULT CALLBACK viewportProc(HWND, UINT, WPARAM, LPARAM);
+    void paintVideo(HDC dc);
     void layout();
     void paint(HDC dc);
     void paintPanel(HDC dc, const RECT& r);
@@ -208,7 +166,7 @@ private:
 
     void onDown(POINT p);
     void onMove(POINT p);
-    void onUp();
+    void onUp(bool cancelled = false);
     void onWheel(int delta, POINT p);
     void onKey(WPARAM key);
     void tick();
@@ -233,6 +191,7 @@ private:
     void toggleFullscreen();
     void toggleEditor();
     void applyVideoFilters();
+    vp::RenderJob previewPicture();
     void applyGeometry();
     void applyFades(bool force = false);
     void applyClipPicture();
@@ -256,13 +215,15 @@ private:
         RECT canvas = videoStage_;
         const int roomW = std::max(1L, canvas.right - canvas.left);
         const int roomH = std::max(1L, canvas.bottom - canvas.top);
-        int vw = video_.width(), vh = video_.height();
+        int vw = stageW_, vh = stageH_;
         if (rotate_ == 90 || rotate_ == 270) std::swap(vw, vh);
-        if (portrait_ && vh > 0) vw = std::max(1, vh * 9 / 16);
         double w = roomW, h = roomH;
         if (vw > 0 && vh > 0) {
-            const double fit = std::min(static_cast<double>(roomW) / vw,
-                                        static_cast<double>(roomH) / vh);
+            const double across = static_cast<double>(roomW) / vw;
+            const double down = static_cast<double>(roomH) / vh;
+            const int mode = isFull_ ? 0 : fitIndex_;
+            const double fit = mode == 2 ? 1.0 : (mode == 1 ? std::max(across, down)
+                                                                          : std::min(across, down));
             w = vw * fit;
             h = vh * fit;
         }
@@ -272,11 +233,6 @@ private:
         const double midY = roomH / 2.0 + panY_ * roomH;
         double left = midX - w / 2.0;
         double top = midY - h / 2.0;
-        // It may not be pushed out of the room it was given, or it would end up
-        // over the panel and the transport - a child window is only clipped by
-        // its parent, and the parent is the whole window. When it is smaller
-        // than the room it stays inside it; when it is larger its edges may not
-        // come in past the edges of the room.
         // The one rule left: a quarter of the picture stays in sight. That is
         // all - and it means the further in it is zoomed the further it can be
         // dragged, which is the way round it should be. Holding its edges to
@@ -291,29 +247,21 @@ private:
         panX_ = (left + w / 2.0 - roomW / 2.0) / roomW;
         panY_ = (top + h / 2.0 - roomH / 2.0) / roomH;
 
-        videoCanvas_ = {static_cast<LONG>(left + 0.5), static_cast<LONG>(top + 0.5),
-                        static_cast<LONG>(left + w + 0.5),
-                        static_cast<LONG>(top + h + 0.5)};
+        videoCanvas_ = {canvas.left + static_cast<LONG>(std::lround(left)),
+                        canvas.top + static_cast<LONG>(std::lround(top)),
+                        canvas.left + static_cast<LONG>(std::lround(left + w)),
+                        canvas.top + static_cast<LONG>(std::lround(top + h))};
         const int cw = std::max(1L, videoCanvas_.right - videoCanvas_.left);
         const int ch = std::max(1L, videoCanvas_.bottom - videoCanvas_.top);
-        SetWindowPos(videoHost_, nullptr, videoCanvas_.left, videoCanvas_.top, cw, ch,
+        if (!videoViewport_ || !videoHost_) return;
+        // Clip by ancestry before moving the large rendering surface. There is
+        // no intermediate frame in which it can cover the panel or transport.
+        SetWindowPos(videoViewport_, nullptr, canvas.left, canvas.top, roomW, roomH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-
-        // Zoomed in, the canvas is larger than the room, and a child window is
-        // clipped only by its parent - which is the whole window, panel and
-        // all. The part that hangs over the room is cut away with a region, so
-        // the picture can never be drawn over anything that is being read.
-        RECT seen{};
-        if (IntersectRect(&seen, &videoCanvas_, &videoStage_)) {
-            OffsetRect(&seen, -videoCanvas_.left, -videoCanvas_.top);
-        } else {
-            seen = {0, 0, 0, 0};
-        }
-        // Recomputed and reapplied every time the picture is placed: a region
-        // is in the window's own coordinates, so a stale one from a different
-        // size or a different room is exactly how the picture ends up over the
-        // panel again.
-        SetWindowRgn(videoHost_, CreateRectRgnIndirect(&seen), TRUE);
+        SetWindowPos(videoHost_, nullptr, videoCanvas_.left - canvas.left,
+                     videoCanvas_.top - canvas.top, cw, ch,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(videoViewport_, nullptr, FALSE);
     }
     // The waves, the loudness figures and the export all read the file
     // through ffmpeg, so when a row is pointed at a different stream they are
@@ -399,6 +347,7 @@ private:
     double fraction(const Hit& h, POINT p) const;
 
     HWND window_ = nullptr;
+    HWND videoViewport_ = nullptr;
     HWND videoHost_ = nullptr;
     HINSTANCE instance_ = nullptr;
     Fonts fonts_;
@@ -436,6 +385,9 @@ private:
     int tracksContent_ = 0;
     int trackScroll_ = 0;
     bool twoRows_ = false;
+    bool narrow_ = false;
+    int transportHeight_ = kTransportTwo;
+    int editorBarHeight_ = kEditorBar;
 
     enum class Drag { None, Seek, Volume, TrackVolume, EqLow, EqMid, EqHigh, Pitch,
                       Adjust, Timeline };
@@ -490,6 +442,7 @@ private:
     // Which piece of the edit the playhead is standing in. Its settings are
     // pushed to the mixer and to mpv when it changes, and only then.
     int liveSegment_ = -2;
+    vp::ClipVideo liveVideoSettings_;
     // The caption file mpv is showing, alternated between two names for the
     // same reason the sharpen shader is: mpv keys what it has loaded on the
     // path, so rewriting one file leaves the old captions on screen.
@@ -513,6 +466,29 @@ private:
 };
 
 // ---------------------------------------------------------------- lifecycle
+
+LRESULT CALLBACK Player::viewportProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
+    auto* self = reinterpret_cast<Player*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(l);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    } else if (message == WM_ERASEBKGND) {
+        return 1;
+    } else if (message == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (self) {
+            const int saved = SaveDC(dc);
+            SetViewportOrgEx(dc, -self->videoStage_.left, -self->videoStage_.top, nullptr);
+            self->paintVideo(dc);
+            RestoreDC(dc, saved);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return videoHostProc(hwnd, message, w, l);
+}
 
 bool Player::create(HINSTANCE instance, const std::wstring& openThis) {
     instance_ = instance;
@@ -549,9 +525,22 @@ bool Player::create(HINSTANCE instance, const std::wstring& openThis) {
     host.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
     host.lpszClassName = L"VideoPlayerCppVideo";
     RegisterClassExW(&host);
-    videoHost_ = CreateWindowExW(0, host.lpszClassName, L"", WS_CHILD | WS_CLIPSIBLINGS,
+    WNDCLASSEXW viewport = host;
+    viewport.lpfnWndProc = &Player::viewportProc;
+    viewport.lpszClassName = L"VideoPlayerCppViewport";
+    RegisterClassExW(&viewport);
+    videoViewport_ = CreateWindowExW(0, viewport.lpszClassName, L"",
+                                     WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                                     0, 0, 100, 100, window_, nullptr, instance, this);
+    if (!videoViewport_) return false;
+    videoHost_ = CreateWindowExW(0, host.lpszClassName, L"",
+                                 WS_CHILD | WS_DISABLED | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                                  0, 0, 100, 100,
-                                 window_, nullptr, instance, nullptr);
+                                 videoViewport_, nullptr, instance, nullptr);
+    if (!videoHost_) return false;
+    // mpv creates a descendant HWND on its own thread and consumes wheel
+    // messages there. Disable input on the rendering subtree so Windows sends
+    // it to our enabled viewport, which owns zoom, pan and click-to-pause.
 
     fonts_.create();
 
@@ -583,6 +572,10 @@ bool Player::create(HINSTANCE instance, const std::wstring& openThis) {
     }
     audio_.setNormaliseTarget(kTargets[targetIndex_]);
     fitIndex_ = std::max(0, std::min(2, s.fitMode));
+    // The host rectangle handles Fit/Fill/Original and view zoom together.
+    // mpv's unscaled mode would cancel zoom when that rectangle grows.
+    video_.setProperty("panscan", "0.0");
+    video_.setProperty("video-unscaled", "no");
     editorOpen_ = s.editorByDefault;
     keepPitch_ = s.keepPitch;
     avOffset_ = s.avOffset;
@@ -649,7 +642,10 @@ void Player::open(const std::wstring& path) {
 
     // Shown only now: an empty mpv window over the middle of the program is
     // what was flickering there before a file was ever opened.
-    ShowWindow(videoHost_, SW_SHOW);
+    if (video_.ready()) {
+        ShowWindow(videoHost_, SW_SHOW);
+        ShowWindow(videoViewport_, SW_SHOW);
+    }
     // A new file starts on the card again; the copy back is turned on
     // only once something actually needs to filter a frame.
     hwdecCopy_ = false;
@@ -721,19 +717,25 @@ void Player::rememberPosition() {
 RECT Player::videoArea() const { return videoStage_; }
 
 void Player::layout() {
+    if (!window_) return;
     RECT client{};
     GetClientRect(window_, &client);
     const int panelLeft = isFull_ ? client.right : client.right - kPanelWidth;
-    const int wide = panelLeft - 36;
+    const int wide = panelLeft - 28;
 
     // One row when the window is wide enough to hold the controls side by side,
     // which is the arrangement of the version this replaces; two only when they
     // would otherwise be squeezed into targets nobody can hit.
     twoRows_ = wide < kOneRowNeeds;
-    const int transport = isFull_ ? 0 : (twoRows_ ? kTransportTwo : kTransportOne);
+    narrow_ = wide < 960;
+    transportHeight_ = narrow_ ? kTransportThree : (twoRows_ ? kTransportTwo : kTransportOne);
+    editorBarHeight_ = kEditorBar + (narrow_ ? 30 : 0);
+    const int transport = isFull_ ? 0 : transportHeight_;
 
-    const int editorHeight =
-        (editorOpen_ && !isFull_) ? kEditorBar + timeline_.heightFor() + 10 : 0;
+    const int editorHeight = (editorOpen_ && !isFull_)
+        ? std::min(editorBarHeight_ + timeline_.heightFor() + 10,
+                   std::max(editorBarHeight_ + 80, static_cast<int>(client.bottom) - transport - 160))
+        : 0;
     const int videoBottom =
         isFull_ ? client.bottom : client.bottom - transport - editorHeight;
     videoStage_ = {0, 0, std::max(1, panelLeft), std::max(1, videoBottom)};
@@ -774,7 +776,7 @@ void Player::layout() {
     // The right-hand group is placed from the right edge inwards, so it stays
     // put whatever happens to the left of it.
     int rx = panelLeft - 14;
-    const int rightRow = twoRows_ ? y + 30 : row;
+    const int rightRow = narrow_ ? y + 102 : row;
     auto putRight = [&](Hit& h, int w, int gap = 3) {
         h.r = {rx - w, rightRow, rx, rightRow + rowH};
         rx -= w + gap;
@@ -846,21 +848,34 @@ void Player::layout() {
         putEdit(editPreviews_, 126, 12);
         putEdit(editSaveProject_, 108, 4);
         putEdit(editOpenProject_, 112);
+        if (narrow_) {
+            ex = 14;
+            putEdit(editMarkIn_, 94, 4);
+            putEdit(editMarkOut_, 86, 4);
+            putEdit(editClearMarks_, 98, 8);
+            putEdit(editAddText_, 96, 4);
+            putEdit(editPreviews_, 126);
+            ex = 14;
+            rowTop = barTop + 60;
+            putEdit(editSaveProject_, 108, 4);
+            putEdit(editOpenProject_, 112);
+        }
 
         // The two property windows sit at the right-hand end, beside Render:
         // they are what the row is opened for, and the cutting is on the row
         // above. The one for a single row only appears when a single row has
         // been picked, because that is the only time it means anything.
-        editRender_.r = {panelLeft - 110, barTop + 30, panelLeft - 14, barTop + 56};
-        editClipProps_.r = {editRender_.r.left - 158, barTop + 30,
-                            editRender_.r.left - 12, barTop + 56};
+        const int propsTop = barTop + (narrow_ ? 60 : 30);
+        editRender_.r = {panelLeft - 110, propsTop, panelLeft - 14, propsTop + 26};
+        editClipProps_.r = {editRender_.r.left - 158, propsTop,
+                            editRender_.r.left - 12, propsTop + 26};
         // Always laid out, drawn only when a row is picked: deciding it here
         // meant it could not appear, because the layout does not run again
         // when something is selected.
-        editLocalProps_.r = {editClipProps_.r.left - 156, barTop + 30,
-                             editClipProps_.r.left - 6, barTop + 56};
+        editLocalProps_.r = {editClipProps_.r.left - 156, propsTop,
+                             editClipProps_.r.left - 6, propsTop + 26};
 
-        RECT strip{10, barTop + kEditorBar - 8, panelLeft - 10, client.bottom - 6};
+        RECT strip{10, barTop + editorBarHeight_ - 8, panelLeft - 10, client.bottom - 6};
         timeline_.setBounds(strip);
     } else {
         timeline_.setBounds(RECT{0, 0, 0, 0});
@@ -898,6 +913,10 @@ void Player::layout() {
     eqPitch_.resize(expanded_.size());
     eqReset_.resize(expanded_.size());
 
+    tracksContent_ = 0;
+    for (char expanded : expanded_) tracksContent_ += (expanded ? kTrackOpen : kTrackRow) + 5;
+    trackScroll_ = std::clamp(trackScroll_, 0,
+                             std::max(0, tracksContent_ - static_cast<int>(tracksView_.bottom - tracksView_.top)));
     int ty = tracksView_.top - trackScroll_;
     for (size_t i = 0; i < expanded_.size(); ++i) {
         const int top = ty;
@@ -935,6 +954,49 @@ void Player::layout() {
 
 // ------------------------------------------------------------------ painting
 
+void Player::paintVideo(HDC dc) {
+    const RECT video = videoArea();
+    // The letterbox. The picture's own window sits inside this and is
+    // clipped away from it, so nothing is drawn twice.
+    fill(dc, video, RGB(0x08, 0x09, 0x0c));
+
+    // And a line round the canvas: everything inside it is the file that
+    // will be written, everything outside is only the room it sits in. A
+    // picture pushed past this line is cut here and cut in the export.
+    // One pixel clear of the frame on every side: the line marks the
+    // canvas, it is not part of the picture, and the export knows nothing
+    // about it - what is written is the file's own resolution.
+    RECT edge{videoCanvas_.left - 2, videoCanvas_.top - 2,
+              videoCanvas_.right + 2, videoCanvas_.bottom + 2};
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, video.left, video.top, video.right, video.bottom);
+    HPEN pen = CreatePen(PS_SOLID, 1, kLineHot);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ op = SelectObject(dc, pen);
+    Rectangle(dc, edge.left, edge.top, edge.right, edge.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+
+    // Corners, so the canvas is legible even against a bright picture.
+    const int arm = 14;
+    auto corner = [&](int x, int y, int dx, int dy) {
+        RECT a{x, y, x + dx * arm, y + dy * 2};
+        RECT b{x, y, x + dx * 2, y + dy * arm};
+        if (a.left > a.right) std::swap(a.left, a.right);
+        if (a.top > a.bottom) std::swap(a.top, a.bottom);
+        if (b.left > b.right) std::swap(b.left, b.right);
+        if (b.top > b.bottom) std::swap(b.top, b.bottom);
+        fill(dc, a, kAccentLit);
+        fill(dc, b, kAccentLit);
+    };
+    corner(edge.left, edge.top, 1, 1);
+    corner(edge.right, edge.top, -1, 1);
+    corner(edge.left, edge.bottom, 1, -1);
+    corner(edge.right, edge.bottom, -1, -1);
+    RestoreDC(dc, saved);
+}
+
 void Player::paint(HDC dc) {
     RECT client{};
     GetClientRect(window_, &client);
@@ -959,46 +1021,7 @@ void Player::paint(HDC dc) {
 
     const RECT video = videoArea();
     if (!path_.empty() && needed(video)) {
-        // The letterbox. The picture's own window sits inside this and is
-        // clipped away from it, so nothing is drawn twice.
-        fill(dc, video, RGB(0x08, 0x09, 0x0c));
-
-        // And a line round the canvas: everything inside it is the file that
-        // will be written, everything outside is only the room it sits in. A
-        // picture pushed past this line is cut here and cut in the export.
-        // One pixel clear of the frame on every side: the line marks the
-        // canvas, it is not part of the picture, and the export knows nothing
-        // about it - what is written is the file's own resolution.
-        RECT edge{videoCanvas_.left - 2, videoCanvas_.top - 2,
-                  videoCanvas_.right + 2, videoCanvas_.bottom + 2};
-        HRGN hold = CreateRectRgn(video.left, video.top, video.right, video.bottom);
-        SelectClipRgn(dc, hold);
-        HPEN pen = CreatePen(PS_SOLID, 1, kLineHot);
-        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        HGDIOBJ op = SelectObject(dc, pen);
-        Rectangle(dc, edge.left, edge.top, edge.right, edge.bottom);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        DeleteObject(pen);
-
-        // Corners, so the canvas is legible even against a bright picture.
-        const int arm = 14;
-        auto corner = [&](int x, int y, int dx, int dy) {
-            RECT a{x, y, x + dx * arm, y + dy * 2};
-            RECT b{x, y, x + dx * 2, y + dy * arm};
-            if (a.left > a.right) std::swap(a.left, a.right);
-            if (a.top > a.bottom) std::swap(a.top, a.bottom);
-            if (b.left > b.right) std::swap(b.left, b.right);
-            if (b.top > b.bottom) std::swap(b.top, b.bottom);
-            fill(dc, a, kAccentLit);
-            fill(dc, b, kAccentLit);
-        };
-        corner(edge.left, edge.top, 1, 1);
-        corner(edge.right, edge.top, -1, 1);
-        corner(edge.left, edge.bottom, 1, -1);
-        corner(edge.right, edge.bottom, -1, -1);
-        SelectClipRgn(dc, nullptr);
-        DeleteObject(hold);
+        paintVideo(dc);
     }
 
     // With no file open there is nothing for mpv to draw and its window is
@@ -1006,15 +1029,16 @@ void Player::paint(HDC dc) {
     // empty child window in place is what made that area flicker.
     if (path_.empty()) {
         RECT hole{0, 0, client.right - kPanelWidth, video.bottom};
-        if (!needed(hole)) return;
-        fill(dc, hole, RGB(0x0b, 0x0c, 0x0f));
-        RECT line{hole.left, (hole.top + hole.bottom) / 2 - 16, hole.right,
-                  (hole.top + hole.bottom) / 2 + 16};
-        text(dc, line, tr(L"Open a video   \x00b7   Ctrl+O   \x00b7   or drop one here"),
-             kTextFaint, DT_CENTER | DT_SINGLELINE | DT_VCENTER, fonts_.ui);
+        if (needed(hole)) {
+            fill(dc, hole, RGB(0x0b, 0x0c, 0x0f));
+            RECT line{hole.left, (hole.top + hole.bottom) / 2 - 16, hole.right,
+                      (hole.top + hole.bottom) / 2 + 16};
+            text(dc, line, tr(L"Open a video   \x00b7   Ctrl+O   \x00b7   or drop one here"),
+                 kTextFaint, DT_CENTER | DT_SINGLELINE | DT_VCENTER, fonts_.ui);
+        }
     }
 
-    const int transportH = twoRows_ ? kTransportTwo : kTransportOne;
+    const int transportH = transportHeight_;
     RECT transport{0, video.bottom, client.right - kPanelWidth,
                    video.bottom + transportH};
     if (needed(transport)) {
@@ -1110,9 +1134,9 @@ void Player::paintTracks(HDC dc, int x, int w, int& y) {
 
     // The list is clipped to its own box, so a file with a dozen tracks scrolls
     // instead of running over the picture controls under it.
-    const HRGN clip = CreateRectRgn(tracksView_.left, tracksView_.top,
-                                    tracksView_.right, tracksView_.bottom);
-    SelectClipRgn(dc, clip);
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, tracksView_.left, tracksView_.top,
+                      tracksView_.right, tracksView_.bottom);
 
     for (size_t row = 0; row < audio_.tracks().size() && row < trackEnable_.size();
          ++row) {
@@ -1281,8 +1305,7 @@ void Player::paintTracks(HDC dc, int x, int w, int& y) {
              DT_CENTER | DT_SINGLELINE | DT_VCENTER, fonts_.ui);
     }
 
-    SelectClipRgn(dc, nullptr);
-    DeleteObject(clip);
+    RestoreDC(dc, saved);
 
     // A hint that the list goes on, in the one place there is room for it.
     if (tracksContent_ > tracksView_.bottom - tracksView_.top) {
@@ -1414,7 +1437,7 @@ void Player::paintEditorBar(HDC dc) {
     const LONG rightEdge =
         localReady() ? editLocalProps_.r.left : editClipProps_.r.left;
     const std::wstring status = timeline_.statusLine();
-    RECT total{editPreviews_.r.right + 12, editRender_.r.top, rightEdge - 12,
+    RECT total{editOpenProject_.r.right + 12, editRender_.r.top, rightEdge - 12,
                editRender_.r.bottom};
     text(dc, total, status, kTextDim, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS,
          fonts_.tiny);
@@ -1457,7 +1480,8 @@ void Player::paintEditorBar(HDC dc) {
                       L"click a piece for its settings  \x00b7  the knobs at a row\x2019s "
                       L"edges are its fades");
     }
-    RECT hint{14, barTop + 62, editRender_.r.right, barTop + 84};
+    RECT hint{14, barTop + editorBarHeight_ - 42, editRender_.r.right,
+               barTop + editorBarHeight_ - 20};
     text(dc, hint, hintText, kTextFaint, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
          fonts_.tiny);
 }
@@ -1632,6 +1656,8 @@ void Player::onDown(POINT p) {
         panFrom_ = p;
         return;
     }
+
+    if (isFull_) return;
 
     if (open_.has(p)) { choose(); return; }
     if (gear_.has(p)) { openSettings(); return; }
@@ -1841,17 +1867,15 @@ void Player::onDown(POINT p) {
 }
 
 void Player::onMove(POINT p) {
-    // A press on the picture becomes a pan once the mouse has actually moved,
-    // and only while there is something to move: at 100 % the picture fills
-    // nothing it could be slid inside.
+    // Movement distinguishes a pan from a click. Fullscreen ignores panning
+    // while still preventing a completed drag from toggling playback.
     if (pressedVideo_ && !panning_) {
         if (std::abs(p.x - pressedAt_.x) + std::abs(p.y - pressedAt_.y) > 3) {
             movedWhilePressed_ = true;
             // The canvas itself is what moves, so this is worth doing at any
             // zoom - it is how the frame is brought under the eye, not how the
             // film is framed.
-            panning_ = true;
-            panFrom_ = p;
+            panning_ = !isFull_;
         }
     }
 
@@ -1929,7 +1953,7 @@ void Player::onMove(POINT p) {
     InvalidateRect(window_, nullptr, FALSE);
 }
 
-void Player::onUp() {
+void Player::onUp(bool cancelled) {
     // A caption that was dragged has new times, and mpv is holding the old
     // ones until it is handed the file again.
     if (drag_ == Drag::Timeline && !timeline_.texts().empty()) {
@@ -1938,7 +1962,7 @@ void Player::onUp() {
 
     // A clean click on the picture plays or pauses; one that turned into a drag
     // has already done its job by moving the picture.
-    if (pressedVideo_ && !movedWhilePressed_) togglePlay();
+    if (!cancelled && pressedVideo_ && !movedWhilePressed_) togglePlay();
     pressedVideo_ = false;
     movedWhilePressed_ = false;
     panning_ = false;
@@ -1953,6 +1977,12 @@ void Player::onUp() {
 // made zooming and panning impossible.
 void Player::onWheel(int delta, POINT p) {
     const RECT picture = videoArea();
+    const RECT strip = timeline_.bounds();
+    if (!isFull_ && editorOpen_ && PtInRect(&strip, p)) {
+        timeline_.scrollRows(delta > 0 ? -60 : 60);
+        InvalidateRect(window_, &strip, FALSE);
+        return;
+    }
     if (!isFull_ && PtInRect(&tracksView_, p) &&
         tracksContent_ > tracksView_.bottom - tracksView_.top) {
         const int span = tracksView_.bottom - tracksView_.top;
@@ -1962,6 +1992,7 @@ void Player::onWheel(int delta, POINT p) {
         InvalidateRect(window_, nullptr, FALSE);
         return;
     }
+    if (isFull_) return;
     if (volume_.has(p) || muteButton_.has(p)) {
         setVolume(volume_level_ + (delta > 0 ? 1.0f : -1.0f) *
                                       vp::settings().volumeStep / 100.0f);
@@ -1991,7 +2022,8 @@ void Player::seekBy(double d) { seekTo(audio_.position() + d); }
 void Player::seekTo(double s) {
     s = std::max(0.0, std::min(audio_.duration(), s));
     audio_.seek(s);
-    video_.seek(s);
+    video_.seek(s + avOffset_);
+    applyClipSettings(false);
     InvalidateRect(window_, nullptr, FALSE);
 }
 
@@ -2053,8 +2085,7 @@ void Player::cycleSpeed(int direction) {
 
 void Player::cycleFit() {
     fitIndex_ = (fitIndex_ + 1) % 3;
-    video_.setProperty("panscan", fitIndex_ == 1 ? "1.0" : "0.0");
-    video_.setProperty("video-unscaled", fitIndex_ == 2 ? "yes" : "no");
+    placeCanvas();
     vp::settings().fitMode = fitIndex_;
     say(tr(kFitNames[fitIndex_]));
 }
@@ -2097,14 +2128,7 @@ int Player::clipAdjust(size_t which) const {
 void Player::applyAdjust(size_t i) {
     const Adjust& a = adjust_[i];
     switch (a.kind) {
-        case AdjustKind::Property: {
-            const int total = std::max(a.lo, std::min(a.hi,
-                                        a.value + clipAdjust(i)));
-            char value[16];
-            _snprintf_s(value, sizeof(value), _TRUNCATE, "%d", total);
-            video_.setProperty(a.property, value);
-            break;
-        }
+        case AdjustKind::Property: applyVideoFilters(); break;
         case AdjustKind::Sharpen: sharpenDueAt_ = GetTickCount() + 70; break;
         case AdjustKind::Denoise: applyDenoise(); break;
         case AdjustKind::Zoom:
@@ -2134,34 +2158,9 @@ void Player::applyAdjust(size_t i) {
 }
 
 void Player::applySharpen() {
-    const double amount =
-        std::max(0, std::min(200, adjust_[5].value + clipAdjust(5))) / 100.0;
-    if (amount < 0.005) {
-        video_.setProperty("glsl-shaders", "");
-        return;
-    }
-
-    // Written to alternating file names. mpv keys its shader cache on the path,
-    // so rewriting the same file leaves the old shader running; two slots make
-    // every change take effect.
-    shaderSlot_ = 1 - shaderSlot_;
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring dir = exe;
-    const size_t slash = dir.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) dir.resize(slash + 1);
-
-    wchar_t name[MAX_PATH];
-    _snwprintf_s(name, _TRUNCATE, L"%s_sharpen%d.glsl", dir.c_str(), shaderSlot_);
-    wchar_t body[4096];
-    _snwprintf_s(body, _TRUNCATE, kSharpenShader, amount);
-
-    std::ofstream out(name, std::ios::binary | std::ios::trunc);
-    if (!out) return;
-    out << vp::toUtf8(body);
-    out.close();
-
-    video_.setProperty("glsl-shaders", vp::toUtf8(name));
+    // Use the same kernel in preview and export.
+    video_.setProperty("glsl-shaders", "");
+    applyVideoFilters();
 }
 
 void Player::applyDenoise() { applyVideoFilters(); }
@@ -2302,93 +2301,34 @@ void Player::deleteVideoPreset() {
 // Flips, the portrait crop and denoising all end up in mpv's filter chain, so
 // they are built together: setting the chain to one of them alone would drop
 // the others.
+vp::RenderJob Player::previewPicture() {
+    vp::RenderJob job;
+    job.sourceWidth = video_.width(); job.sourceHeight = video_.height();
+    job.duration = timeline_.duration();
+    job.fadeStart = timeline_.outLow(); job.fadeEnd = timeline_.outHigh();
+    job.fades = {timeline_.fades(0)};
+    if (adjust_.size() >= 7) {
+        job.contrast = adjust_[0].value; job.brightness = adjust_[1].value;
+        job.saturation = adjust_[2].value; job.gamma = adjust_[3].value;
+        job.hue = adjust_[4].value; job.sharpen = adjust_[5].value;
+        job.denoise = adjust_[6].value;
+    }
+    job.flipH = flipH_; job.flipV = flipV_; job.portrait = portrait_;
+    job.panX = framePanX_;
+    return job;
+}
+
 void Player::applyVideoFilters() {
-    std::string chain;
-    auto add = [&](const std::string& part) {
-        if (!chain.empty()) chain += ",";
-        chain += part;
-    };
-    // The clip's own crop comes first: it picks the part of the frame
-    // everything after it works on, which is what a pan zone means.
-    if (liveSegment_ >= 0 &&
-        liveSegment_ < static_cast<int>(timeline_.segments().size())) {
-        const vp::ClipVideo& v =
-            timeline_.segments()[static_cast<size_t>(liveSegment_)].video;
-        double cx = 0.0, cy = 0.0, cw = 1.0, ch = 1.0;
-        if (vp::clipWindow(v, &cx, &cy, &cw, &ch)) {
-            char crop[200];
-            _snprintf_s(crop, sizeof(crop), _TRUNCATE,
-                        "lavfi=[crop=iw*%.4f:ih*%.4f:iw*%.4f:ih*%.4f]", cw, ch,
-                        cx, cy);
-            add(crop);
-        }
+    vp::ClipVideo clip;
+    if (liveSegment_ >= 0 && liveSegment_ < static_cast<int>(timeline_.segments().size()))
+        clip = timeline_.segments()[static_cast<size_t>(liveSegment_)].video;
+    const std::string chain = vp::pictureFilters(previewPicture(), clip);
+    const bool needsFilter = chain != "null";
+    if (needsFilter != hwdecCopy_) {
+        hwdecCopy_ = needsFilter;
+        video_.setProperty("hwdec", needsFilter ? "auto-copy" : "auto");
     }
-
-    // The picture's fade in and out. It reads the timestamp of the frame, so
-    // it stays right through a seek, and it is the same ramp the export writes.
-    {
-        const vp::RowFades& f = timeline_.fades(0);
-        const double lo = timeline_.outLow(), hi = timeline_.outHigh();
-        char fade[160];
-        if (f.in > 0.01) {
-            _snprintf_s(fade, sizeof(fade), _TRUNCATE,
-                        "lavfi=[fade=t=in:st=%.3f:d=%.3f]", lo, f.in);
-            add(fade);
-        }
-        if (f.out > 0.01 && hi > lo) {
-            _snprintf_s(fade, sizeof(fade), _TRUNCATE,
-                        "lavfi=[fade=t=out:st=%.3f:d=%.3f]", hi - f.out, f.out);
-            add(fade);
-        }
-    }
-
-    if (portrait_) {
-        // The tall canvas slides across the wide picture, so what it shows can
-        // be chosen instead of always being the middle.
-        const double t = std::max(0.0, std::min(1.0, 0.5 - framePanX_ * 0.5));
-        char crop[160];
-        _snprintf_s(crop, sizeof(crop), _TRUNCATE,
-                    "lavfi=[crop=w=ih*9/16:h=ih:x=(iw-ih*9/16)*%.4f:y=0]", t);
-        add(crop);
-    }
-    if (flipH_) add("hflip");
-    if (flipV_) add("vflip");
-
-    const int denoise = std::max(0, std::min(100, adjust_[6].value + clipAdjust(6)));
-    if (denoise > 0) {
-        const double d = denoise / 100.0;
-        char filter[160];
-        _snprintf_s(filter, sizeof(filter), _TRUNCATE,
-                    "lavfi=[hqdn3d=%.2f:%.2f:%.2f:%.2f]", 2.0 * d, 1.5 * d, 4.0 * d,
-                    4.0 * d);
-        add(filter);
-    }
-
-    // Visibility, as a wash towards black. mpv has no opacity of its own, and
-    // scaling the channels is what "darker" means anyway.
-    if (liveSegment_ >= 0 &&
-        liveSegment_ < static_cast<int>(timeline_.segments().size())) {
-        const vp::ClipVideo& v =
-            timeline_.segments()[static_cast<size_t>(liveSegment_)].video;
-        if (v.set && v.opacity < 0.999f) {
-            char wash[200];
-            _snprintf_s(wash, sizeof(wash), _TRUNCATE,
-                        "lavfi=[colorchannelmixer=rr=%.3f:gg=%.3f:bb=%.3f]",
-                        v.opacity, v.opacity, v.opacity);
-            add(wash);
-        }
-    }
-
-    // Software filters cannot touch a frame that never leaves the graphics
-    // card, and with plain hardware decoding mpv takes the chain without
-    // applying any of it - which is why the crop, the wash and the fades were
-    // set and did nothing. Frames are copied back only while there is a chain
-    // to run; with none, decoding stays entirely on the card.
-    if (!chain.empty() && !hwdecCopy_) {
-        hwdecCopy_ = true;
-        video_.setProperty("hwdec", "auto-copy");
-    }
-    video_.setProperty("vf", chain);
+    video_.setProperty("vf", needsFilter ? "lavfi=[" + chain + "]" : "");
 }
 
 // Rotation, zoom and pan are properties rather than filters: mpv does them on
@@ -2442,17 +2382,17 @@ void Player::applyPan() {
     // what lets a tall video be moved across a wide window.
     char text[32];
     _snprintf_s(text, sizeof(text), _TRUNCATE, "%.4f",
-                std::max(-2.0, std::min(2.0,
-                    (portrait_ ? 0.0 : framePanX_) + liveClipPanX_)));
+                (portrait_ ? 0.0 : framePanX_) / frameZoom_);
     video_.setPropertyFast("video-pan-x", text);
     _snprintf_s(text, sizeof(text), _TRUNCATE, "%.4f",
-                std::max(-2.0, std::min(2.0, framePanY_ + liveClipPanY_)));
+                framePanY_ / frameZoom_);
     video_.setPropertyFast("video-pan-y", text);
 }
 
 void Player::bumpRotate(int degrees) {
     rotate_ = ((rotate_ + degrees) % 360 + 360) % 360;
     applyGeometry();
+    placeCanvas();
     wchar_t t[32];
     _snwprintf_s(t, _TRUNCATE, tr(L"Rotation %d\x00b0"), rotate_);
     say(t);
@@ -2922,10 +2862,13 @@ void Player::openClipProperties(int segment, int row) {
         vp::ClipAudio copy = before;
         // The per-piece mute the strip already had and the switch in the window
         // are the same thing, so they are shown as the same thing.
-        copy.silent = piece.muted.count(track) > 0 || copy.silent;
+        const bool mutedBefore = piece.muted.count(track) > 0;
+        copy.silent = mutedBefore || copy.silent;
         const std::wstring name = widen(audio_.tracks()[static_cast<size_t>(track)].name);
         auto show = [this, segment, track](const vp::ClipAudio& live) {
             timeline_.clipAudio(segment, track) = live;
+            auto& muted = timeline_.segments()[static_cast<size_t>(segment)].muted;
+            if (live.silent) muted.insert(track); else muted.erase(track);
             applyClipSettings(true);
         };
         if (vp::runClipAudioWindow(window_, instance_, copy, name, when, show)) {
@@ -2935,6 +2878,8 @@ void Player::openClipProperties(int segment, int row) {
             say(tr(L"Clip updated"));
         } else {
             timeline_.clipAudio(segment, track) = before;
+            auto& muted = timeline_.segments()[static_cast<size_t>(segment)].muted;
+            if (mutedBefore) muted.insert(track); else muted.erase(track);
         }
         applyClipSettings(true);
     }
@@ -3022,9 +2967,14 @@ void Player::refreshCaptions() {
 // on a change of piece: these are property writes and a shader reload, and
 // doing them twenty times a second would cost more than the edit does.
 void Player::applyClipSettings(bool force) {
+    audio_.setClipEdits(timeline_.segments());
     const int at = timeline_.segmentAt(audio_.position());
-    if (!force && at == liveSegment_) return;
+    const bool changed = at != liveSegment_;
+    const vp::ClipVideo local = at >= 0 ? timeline_.segments()[static_cast<size_t>(at)].video : vp::ClipVideo{};
+    const bool propertiesChanged = !vp::sameClipVideo(local,liveVideoSettings_);
+    if (!force && !changed && !propertiesChanged) return;
     liveSegment_ = at;
+    liveVideoSettings_ = local;
 
     // A piece with a speed of its own plays at it, on top of the speed chip.
     // Leaving the piece puts the chip's own figure back.
@@ -3070,9 +3020,12 @@ void Player::applyClipSettings(bool force) {
             c.clipPitch.store(0.0f);
             c.clipSilent.store(false);
         }
+        if (at >= 0 && timeline_.segments()[static_cast<size_t>(at)].muted.count(static_cast<int>(i)))
+            c.clipSilent.store(true);
     }
 
-    pictureDueAt_ = GetTickCount() + 60;
+    if (changed || (!force && propertiesChanged)) applyClipPicture();
+    else pictureDueAt_ = GetTickCount() + 60;
 }
 
 // ---------------------------------------------------------------------------
@@ -3154,13 +3107,18 @@ void Player::saveProject() {
 
     root.set("edit", timeline_.toJson());
 
-    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    const std::wstring temp = std::wstring(file) + L".new";
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
     if (!out) {
         say(tr(L"the work could not be written"));
         return;
     }
     out << root.dump(2);
     out.close();
+    if (!out || !MoveFileExW(temp.c_str(), file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        say(tr(L"the work could not be written"));
+        return;
+    }
     projectPath_ = file;
     say(tr(L"Work saved"));
 }
@@ -3207,9 +3165,12 @@ void Player::openProject() {
     flipV_ = picture["flipV"].asBool(false);
     portrait_ = picture["portrait"].asBool(false);
     fitIndex_ = std::max(0, std::min(2, picture["fit"].asInt(0)));
-    frameZoom_ = picture["frameZoom"].asNumber(1.0);
-    framePanX_ = picture["framePanX"].asNumber(0.0);
-    framePanY_ = picture["framePanY"].asNumber(0.0);
+    frameZoom_ = std::clamp(picture["frameZoom"].asNumber(1.0), .25, 4.0);
+    framePanX_ = std::clamp(picture["framePanX"].asNumber(0.0), -1.0, 1.0);
+    framePanY_ = std::clamp(picture["framePanY"].asNumber(0.0), -1.0, 1.0);
+    adjust_[7].value = static_cast<int>(std::lround(frameZoom_*100));
+    adjust_[8].value = static_cast<int>(std::lround(framePanX_*100));
+    adjust_[9].value = static_cast<int>(std::lround(framePanY_*100));
     keepPitch_ = picture["keepPitch"].asBool(true);
     audio_.setKeepPitch(keepPitch_);
     setSpeedIndex(picture["speedIndex"].asInt(speedIndex_));
@@ -3251,11 +3212,8 @@ void Player::openProject() {
 // The picture side of a clip change: a filter chain and a shader, both of which
 // cost far too much to do per mouse move.
 void Player::applyClipPicture() {
+    pictureDueAt_ = 0;
     applyVideoFilters();
-    for (size_t i = 0; i < adjust_.size(); ++i) {
-        if (adjust_[i].kind == AdjustKind::Property) applyAdjust(i);
-    }
-    applySharpen();
 }
 
 void Player::openRender() {
@@ -3269,7 +3227,12 @@ void Player::openRender() {
     vp::RenderJob job;
     job.source = path_;
     job.duration = audio_.duration();
+    job.fadeStart = timeline_.outLow(); job.fadeEnd = timeline_.outHigh();
     job.segments = timeline_.keptSegments();
+    if (job.segments.empty()) {
+        say(L"Nothing to render: check cuts and IN/OUT.");
+        return;
+    }
     job.fades.push_back(timeline_.fades(0));           // the picture
     for (size_t i = 0; i < audio_.tracks().size(); ++i) {
         // The strip counts its sound rows from the bottom up; the export counts
@@ -3284,7 +3247,8 @@ void Player::openRender() {
         const bool live = fromPlayer_ || i >= overrideTracks_.size();
         const OverrideTrack& o =
             live ? OverrideTrack{} : overrideTracks_[i];
-        t.include = live ? audio_.controls(i).enabled.load() : o.include;
+        t.include = live ? (audio_.anySolo() ? audio_.controls(i).solo.load()
+                                            : audio_.controls(i).enabled.load()) : o.include;
         t.target = live ? audio_.normaliseTarget() : overrideTarget_;
         t.volume = live ? audio_.controls(i).gain.load() : o.gain;
         t.eqLow = live ? audio_.controls(i).eqLow.load() : o.low;
@@ -3341,17 +3305,24 @@ void Player::openRender() {
             out << timeline_.assDocument(std::max(16, video_.width()),
                                          std::max(16, video_.height()));
             out.close();
-            job.captions = path;
+            if (out) job.captions = path;
+        }
+        if (job.captions.empty()) {
+            say(L"Cannot save captions for the export.");
+            return;
         }
     }
 
     const bool wasPlaying = audio_.playing();
     if (wasPlaying) { audio_.pause(); video_.setPaused(true); }
-    if (const char* dump = std::getenv("VP_CMD_LOG")) {
+    char* dump = nullptr;
+    size_t dumpLength = 0;
+    if (_dupenv_s(&dump, &dumpLength, "VP_CMD_LOG") == 0 && dump) {
         vp::RenderPreset probe;
         std::ofstream log(dump, std::ios::trunc);
         log << vp::toUtf8(vp::buildRenderCommand(job, probe, L"TEST.mp4"));
     }
+    std::free(dump);
     if (vp::runRenderWindow(window_, instance_, job, &fromPlayer_)) {
         say(tr(L"Render finished"));
     }
@@ -3419,7 +3390,7 @@ void Player::toggleFullscreen() {
     panX_ = panY_ = 0.0;
     if (isFull_) {
         GetWindowRect(window_, &beforeFull_);
-        SetWindowLongPtrW(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowLongPtrW(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
         HMONITOR mon = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
@@ -3427,7 +3398,7 @@ void Player::toggleFullscreen() {
                      mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED);
     } else {
-        SetWindowLongPtrW(window_, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowLongPtrW(window_, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN);
         SetWindowPos(window_, nullptr, beforeFull_.left, beforeFull_.top,
                      beforeFull_.right - beforeFull_.left,
                      beforeFull_.bottom - beforeFull_.top,
@@ -3518,7 +3489,7 @@ void Player::onKey(WPARAM key) {
         case 'Z':
             zoom_ = 1.0;
             panX_ = panY_ = 0.0;
-            applyGeometry();
+            placeCanvas();
             say(L"Zoom 100%");
             break;
         case 'L':
@@ -3594,6 +3565,10 @@ void Player::tick() {
     applyFades();
 
     // ---- background work that has finished
+    if (loudnessJob_.done()) {
+        for (size_t i=0;i<audio_.tracks().size() && i<loudnessJob_.result().size();++i)
+            audio_.controls(i).normaliseReference.store(loudnessJob_.result()[i]);
+    }
     if (waveJob_.done() && !timeline_.hasWaveforms()) {
         timeline_.setWaveforms(waveJob_.result());
         InvalidateRect(window_, nullptr, TRUE);
@@ -3607,9 +3582,10 @@ void Player::tick() {
     const double at = audio_.position();
     if (audio_.playing() && timeline_.duration() > 0.0) {
         const double lo = timeline_.outLow(), hi = timeline_.outHigh();
-        if (looping_ && at >= hi - 0.05) {
-            seekTo(lo);
-        } else if (at < lo - 0.5) {
+        if (at >= hi) {
+            if (looping_) seekTo(lo);
+            else { audio_.pause(); video_.setPaused(true); }
+        } else if (at < lo - 1.0 / 48000) {
             seekTo(lo);
         } else {
             for (const vp::Segment& s : timeline_.segments()) {
@@ -3617,7 +3593,7 @@ void Player::tick() {
                 // Skipped rather than silenced: a cut stretch is not in the
                 // output, so playing it back would preview a file that will not
                 // exist.
-                seekTo(s.end + 0.02);
+                seekTo(s.end);
                 break;
             }
         }
@@ -3684,9 +3660,10 @@ void Player::tick() {
         }
     }
 
-    if (video_.width() != stageW_ || video_.height() != stageH_) {
-        stageW_ = video_.width();
-        stageH_ = video_.height();
+    const int displayW = video_.displayWidth(), displayH = video_.displayHeight();
+    if (displayW != stageW_ || displayH != stageH_) {
+        stageW_ = displayW;
+        stageH_ = displayH;
         layout();
         InvalidateRect(window_, nullptr, TRUE);
     }
@@ -3781,8 +3758,18 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
                 // off altogether so the card stops decoding it, and the sound
                 // plays on. It comes back where the sound has got to.
                 self->sleepVideo(w == SIZE_MINIMIZED);
-                self->layout();
+                if (w != SIZE_MINIMIZED) self->layout();
                 InvalidateRect(hwnd, nullptr, TRUE);
+            }
+            return 0;
+        case WM_GETMINMAXINFO:
+            if (!self || !self->isFull_) {
+                RECT minimum{0, 0, 1240, 560};
+                AdjustWindowRectEx(&minimum, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                    FALSE, WS_EX_ACCEPTFILES);
+                auto* limits = reinterpret_cast<MINMAXINFO*>(l);
+                limits->ptMinTrackSize = {minimum.right - minimum.left,
+                                           minimum.bottom - minimum.top};
             }
             return 0;
         case WM_ERASEBKGND:
@@ -3808,6 +3795,9 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
                     self->bufferSize_ = {client.right, client.bottom};
                 }
                 HDC mem = self->bufferDc_;
+                ScopedDc drawing(mem);
+                IntersectClipRect(mem, ps.rcPaint.left, ps.rcPaint.top,
+                                  ps.rcPaint.right, ps.rcPaint.bottom);
                 self->paintClip_ = ps.rcPaint;
                 fill(mem, ps.rcPaint, kBack);
                 self->paint(mem);
@@ -3821,6 +3811,7 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         }
         case WM_LBUTTONDOWN:
             if (self) {
+                SetFocus(hwnd);
                 SetCapture(hwnd);
                 self->onDown({GET_X_LPARAM(l), GET_Y_LPARAM(l)});
                 // Every click repaints. Several switches - levelling, solo, a
@@ -3833,16 +3824,13 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         case WM_LBUTTONDBLCLK:
             if (self) {
                 POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-                RECT picture{};
-                GetClientRect(self->videoHost_, &picture);
-                MapWindowPoints(self->videoHost_, hwnd,
-                                reinterpret_cast<POINT*>(&picture), 2);
+                const RECT picture = self->videoArea();
                 if (PtInRect(&picture, p)) {
                     // The first click of the pair already toggled play, so this
                     // puts it back before going full screen.
                     self->togglePlay();
                     self->toggleFullscreen();
-                } else if (self->editorOpen_ && self->timeline_.onDoubleClick(p)) {
+                } else if (!self->isFull_ && self->editorOpen_ && self->timeline_.onDoubleClick(p)) {
                     if (self->timeline_.inTextRow(p)) {
                         self->openTextProperties(self->timeline_.selectedText());
                     } else {
@@ -3864,8 +3852,15 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         case WM_LBUTTONUP:
             if (self) { self->onUp(); ReleaseCapture(); }
             return 0;
+        case WM_CAPTURECHANGED:
+            if (self && reinterpret_cast<HWND>(l) != hwnd) self->onUp(true);
+            return 0;
+        case WM_CANCELMODE:
+            if (self) self->onUp(true);
+            if (GetCapture() == hwnd) ReleaseCapture();
+            return 0;
         case WM_RBUTTONDOWN:
-            if (self && self->editorOpen_) {
+            if (self && !self->isFull_ && self->editorOpen_) {
                 POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                 RECT strip = self->timeline_.bounds();
                 const int row = self->timeline_.rowAt(p);
@@ -3923,7 +3918,7 @@ LRESULT CALLBACK Player::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
-            if (self) self->releaseBuffer();
+            if (self) { self->releaseBuffer(); self->fonts_.destroy(); }
             PostQuitMessage(0);
             return 0;
         default: break;
@@ -3943,16 +3938,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     auto player = std::make_unique<Player>();
-    if (!player->create(instance, openThis)) return 1;
+    if (!player->create(instance, openThis)) {
+        player.reset();
+        CoUninitialize();
+        return 1;
+    }
 
-    MSG message;
+    MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    player.reset();
     CoUninitialize();
     return 0;
 }
-
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Created by FajkPes with assistance from ChatGPT Codex and Claude Code.

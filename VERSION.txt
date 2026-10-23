@@ -1,3 +1,3 @@
-Video Editor Player v1.0.0
-
-Created by FajkPes with assistance from ChatGPT Codex and Claude Code.
+Video Editor Player
+Publication snapshot: 2026-10-23
+Windows x64

@@ -48,9 +48,10 @@ bool AudioEngine::startOutput(std::string* error) {
             const int need = WideCharToMultiByte(CP_UTF8, 0, name.pwszVal, -1,
                                                  nullptr, 0, nullptr, nullptr);
             if (need > 1) {
-                std::string out(static_cast<size_t>(need - 1), ' ');
+                std::string out(static_cast<size_t>(need), '\0');
                 WideCharToMultiByte(CP_UTF8, 0, name.pwszVal, -1, &out[0], need,
                                     nullptr, nullptr);
+                out.resize(static_cast<size_t>(need-1));
                 impl_->outputName = out;
             }
         }
@@ -68,6 +69,20 @@ bool AudioEngine::startOutput(std::string* error) {
         return false;
     }
 
+    // The mixer always produces stereo float at 48 kHz. Ask Windows to convert
+    // to the endpoint's format; writing our samples at a 44.1 kHz device rate
+    // otherwise changes pitch, duration and the video clock.
+    CoTaskMemFree(impl_->mixFormat);
+    impl_->mixFormat = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+    if (!impl_->mixFormat) { if (error) *error = "out of memory for audio format"; return false; }
+    *impl_->mixFormat = {};
+    impl_->mixFormat->wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    impl_->mixFormat->nChannels = kMixChannels;
+    impl_->mixFormat->nSamplesPerSec = kMixRate;
+    impl_->mixFormat->wBitsPerSample = 32;
+    impl_->mixFormat->nBlockAlign = kMixChannels * sizeof(float);
+    impl_->mixFormat->nAvgBytesPerSec = kMixRate * impl_->mixFormat->nBlockAlign;
+
     // Shared mode, event driven, at the device's own period.
     //
     // This is the ordinary path every application takes, and taking it is the
@@ -78,7 +93,9 @@ bool AudioEngine::startOutput(std::string* error) {
     REFERENCE_TIME period = 0;
     impl_->client->GetDevicePeriod(&period, nullptr);
     hr = impl_->client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                   AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                   AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                                       AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                       AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                                    period, 0, impl_->mixFormat, nullptr);
     if (FAILED(hr)) {
         if (error) *error = "the playback device refused the format";
@@ -90,7 +107,10 @@ bool AudioEngine::startOutput(std::string* error) {
         if (error) *error = "could not create the buffer event";
         return false;
     }
-    impl_->client->SetEventHandle(impl_->bufferEvent);
+    if (FAILED(impl_->client->SetEventHandle(impl_->bufferEvent))) {
+        if (error) *error = "could not attach the audio buffer event";
+        return false;
+    }
 
     if (FAILED(impl_->client->GetBufferSize(&impl_->bufferFrames))) {
         if (error) *error = "could not read the device buffer size";
@@ -120,12 +140,16 @@ bool AudioEngine::startOutput(std::string* error) {
                      static_cast<double>(impl_->mixFormat->nSamplesPerSec);
 
     impl_->renderStop.store(false);
-    impl_->client->Start();
+    if (FAILED(impl_->client->Start())) {
+        if (error) *error = "the playback device refused to start";
+        return false;
+    }
     impl_->renderThread = std::thread([this] { renderLoop(); });
     return true;
 }
 
 void AudioEngine::renderLoop() {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     // The one thread here with a deadline, and MMCSS is how Windows is told so.
     // Priority alone only decides who wins a contest for the processor; this
     // says the work counts as late if it is not finished by the next device
@@ -153,6 +177,7 @@ void AudioEngine::renderLoop() {
 
     while (!impl_->renderStop.load(std::memory_order_relaxed)) {
         if (WaitForSingleObject(impl_->bufferEvent, 200) != WAIT_OBJECT_0) continue;
+        std::lock_guard<std::mutex> lock(impl_->renderMutex);
 
         UINT32 padding = 0;
         if (FAILED(impl_->client->GetCurrentPadding(&padding))) continue;
@@ -169,12 +194,18 @@ void AudioEngine::renderLoop() {
         // is then handed to the device is a separate question.
         if (impl_->flushSpeed.exchange(false, std::memory_order_acquire)) {
             impl_->speedChanger.reset();
+            for (auto& eq : impl_->equalisers) eq.reset();
+            for (auto& shifter : impl_->shifters) shifter = PitchShifter{};
+            std::fill(impl_->pitchSetting.begin(), impl_->pitchSetting.end(), 0.0f);
         }
         impl_->speedChanger.configure(speed_.load(std::memory_order_relaxed),
                                       keepPitch_.load(std::memory_order_relaxed));
 
-        if (!impl_->speedChanger.active()) {
-            mixBlock(impl_->mixBuffer.data(), frames);
+        int64_t produced = 0;
+        if (!playing_.load(std::memory_order_relaxed) || impl_->outputPosition.load() >= duration_) {
+            // Pausing must preserve the stretcher's queued samples.
+        } else if (!impl_->speedChanger.active()) {
+            produced = mixBlock(impl_->mixBuffer.data(), frames);
         } else {
             // Topped up until it can answer, but never forever: a track that has
             // not decoded far enough stalls the mixer, and spinning here would
@@ -187,8 +218,15 @@ void AudioEngine::renderLoop() {
                 if (mixBlock(impl_->speedSource.data(), chunk) <= 0) break;
                 impl_->speedChanger.push(impl_->speedSource.data(), chunk);
             }
-            impl_->speedChanger.pull(impl_->mixBuffer.data(), frames);
+            produced = impl_->speedChanger.pull(impl_->mixBuffer.data(), frames);
         }
+        const double speed = speed_.load(std::memory_order_relaxed);
+        if (produced > 0) {
+            const double cursor = impl_->outputPosition.load(std::memory_order_relaxed);
+            impl_->outputPosition.store(std::min(duration_, cursor + produced*speed/kMixRate), std::memory_order_relaxed);
+        }
+        impl_->queuedSeconds.store(produced > 0 ? (padding+produced)*speed/kMixRate : 0.0,
+                                   std::memory_order_relaxed);
 
         // Spread our stereo over whatever the endpoint wants, in whatever width
         // it wants. The ordinary case is two channels of float and a copy.
@@ -223,6 +261,7 @@ void AudioEngine::renderLoop() {
     }
 
     if (task) AvRevertMmThreadCharacteristics(task);
+    if (SUCCEEDED(com)) CoUninitialize();
 }
 
 bool AudioEngine::anySolo() const {
@@ -271,6 +310,28 @@ void AudioEngine::reorderTracks(const std::vector<size_t>& order) {
 }
 
 int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
+    const auto edits = std::atomic_load(&impl_->clipEdits);
+    int64_t done = 0;
+    while (done < frames) {
+        const int64_t position = impl_->playPos.load(std::memory_order_relaxed);
+        const Segment* segment = nullptr;
+        int64_t chunk = frames - done;
+        if (edits) for (const auto& item : *edits) {
+            const int64_t start = static_cast<int64_t>(std::llround(item.start*kMixRate));
+            const int64_t end = static_cast<int64_t>(std::llround(item.end*kMixRate));
+            if (position >= start && position < end) {
+                segment = &item; chunk = std::min(chunk,end-position); break;
+            }
+            if (start > position) chunk = std::min(chunk,start-position);
+        }
+        const int64_t made = mixChunk(out+done*kMixChannels,chunk,segment,static_cast<bool>(edits));
+        if (made <= 0) break;
+        done += made;
+    }
+    return done;
+}
+
+int64_t AudioEngine::mixChunk(float* out, int64_t frames, const Segment* segment, bool scheduled) {
     if (!playing_.load(std::memory_order_relaxed)) return 0;  // silence, clock held
 
     const int64_t pos = impl_->playPos.load(std::memory_order_relaxed);
@@ -291,6 +352,7 @@ int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
         if (!audible(i)) continue;
         any = true;
         const int64_t have = impl_->buffers[i]->available(pos);
+        if (impl_->buffers[i]->finished.load(std::memory_order_relaxed)) continue;
         shortest = std::min(shortest, have < 0 ? 0 : have);
     }
     if (!any) shortest = frames;
@@ -317,24 +379,37 @@ int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
             controls_[i]->peak.store(0.0f, std::memory_order_relaxed);
             continue;
         }
+        ClipAudio local;
+        if (scheduled) {
+            if (segment) {
+                const auto found = segment->audio.find(static_cast<int>(i));
+                if (found != segment->audio.end() && found->second.set) local = found->second;
+                if (segment->muted.count(static_cast<int>(i))) local.silent = true;
+            }
+        } else {
+            local.gain=controls_[i]->clipGain.load(); local.eqLow=controls_[i]->clipEqLow.load();
+            local.eqMid=controls_[i]->clipEqMid.load(); local.eqHigh=controls_[i]->clipEqHigh.load();
+            local.pitch=controls_[i]->clipPitch.load(); local.silent=controls_[i]->clipSilent.load();
+        }
 
         // Gathered on its own first, because everything below shapes one track
         // and mixing before shaping would put every track through one filter.
         std::fill(impl_->trackBuffer.begin(), impl_->trackBuffer.end(), 0.0f);
         if (impl_->buffers[i]->mixInto(pos, impl_->trackBuffer.data(), frames, 1.0f) <
             frames) {
-            dropouts_.fetch_add(1, std::memory_order_relaxed);
+            if (!impl_->buffers[i]->finished.load(std::memory_order_relaxed))
+                dropouts_.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Coefficients are rebuilt only when a band has actually moved. Doing it
         // per block would cost more than the filtering.
         // The mixer's bands plus whatever this piece of the edit adds.
         const float lo = controls_[i]->eqLow.load(std::memory_order_relaxed) +
-                         controls_[i]->clipEqLow.load(std::memory_order_relaxed);
+                         local.eqLow;
         const float mid = controls_[i]->eqMid.load(std::memory_order_relaxed) +
-                          controls_[i]->clipEqMid.load(std::memory_order_relaxed);
+                          local.eqMid;
         const float hi = controls_[i]->eqHigh.load(std::memory_order_relaxed) +
-                         controls_[i]->clipEqHigh.load(std::memory_order_relaxed);
+                         local.eqHigh;
         float* seen = &impl_->eqSetting[i * 3];
         if (seen[0] != lo || seen[1] != mid || seen[2] != hi) {
             seen[0] = lo; seen[1] = mid; seen[2] = hi;
@@ -346,7 +421,7 @@ int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
         // been moved is measured as it will be heard.
         const float semitones =
             controls_[i]->pitch.load(std::memory_order_relaxed) +
-            controls_[i]->clipPitch.load(std::memory_order_relaxed);
+            local.pitch;
         if (impl_->pitchSetting[i] != semitones) {
             impl_->pitchSetting[i] = semitones;
             impl_->shifters[i].configure(kMixRate, kMixChannels, semitones);
@@ -362,12 +437,13 @@ int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
                                        std::memory_order_relaxed);
 
         float correction = 1.0f;
+        const double reference = controls_[i]->normaliseReference.load(std::memory_order_relaxed);
         if (normalise && controls_[i]->normalise.load(std::memory_order_relaxed) &&
-            impl_->meters[i].ready()) {
+            (reference > -69.0 || impl_->meters[i].ready())) {
             // Bounded both ways. Without a ceiling a nearly silent track would
             // be lifted until its noise floor was the loudest thing playing.
             const double db = std::max(-12.0, std::min(12.0,
-                                  target - impl_->meters[i].levelDb()));
+                                  target - (reference > -69.0 ? reference : impl_->meters[i].levelDb())));
             correction = static_cast<float>(std::pow(10.0, db / 20.0));
             controls_[i]->normalisationDb.store(static_cast<float>(db),
                                                 std::memory_order_relaxed);
@@ -376,9 +452,9 @@ int64_t AudioEngine::mixBlock(float* out, int64_t frames) {
         }
 
         const float clip =
-            controls_[i]->clipSilent.load(std::memory_order_relaxed)
+            local.silent
                 ? 0.0f
-                : controls_[i]->clipGain.load(std::memory_order_relaxed);
+                : local.gain;
         const float gain = controls_[i]->gain.load(std::memory_order_relaxed) *
                            master * correction * clip;
 

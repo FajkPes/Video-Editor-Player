@@ -15,6 +15,16 @@
 
 namespace vp::theme {
 
+// Nested painters must intersect and restore their caller's clipping region.
+struct ScopedDc {
+    HDC dc;
+    int saved;
+    explicit ScopedDc(HDC target) : dc(target), saved(SaveDC(target)) {}
+    ~ScopedDc() { if (saved) RestoreDC(dc, saved); }
+    ScopedDc(const ScopedDc&) = delete;
+    ScopedDc& operator=(const ScopedDc&) = delete;
+};
+
 // The palette of the version this replaces, value for value, so the two
 // programs look like the same program. bg / panel / panel_hi / border /
 // border_hi / text / muted / dim / accent / accent_dk / track.
@@ -142,8 +152,10 @@ inline void slider(HDC dc, const RECT& r, double fraction, bool live, bool centr
     roundFill(dc, groove, kTrack, 2);
 
     fraction = std::max(0.0, std::min(1.0, fraction));
-    const int at = r.left + static_cast<int>((r.right - r.left) * fraction);
-    const int from = centred ? (r.left + r.right) / 2 : r.left;
+    const int left = r.left + 7;
+    const int right = std::max(left, static_cast<int>(r.right) - 7);
+    const int at = left + static_cast<int>((right - left) * fraction + 0.5);
+    const int from = centred ? (left + right) / 2 : left;
     RECT done{std::min(from, at), mid - 2, std::max(from, at), mid + 2};
     if (done.right > done.left) roundFill(dc, done, live ? kAccent : kAccentDim, 2);
 

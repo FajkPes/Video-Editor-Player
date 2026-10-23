@@ -1,4 +1,5 @@
 #include "render.h"
+#include "picture_filters.h"
 
 #include <windowsx.h>
 #include <commdlg.h>
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <fstream>
 
 #include "lang.h"
 #include "media_tools.h"
@@ -54,7 +56,7 @@ const float kLufsChoices[] = {-23.0f, -18.0f, -16.0f, -14.0f, -12.0f, -9.0f};
 // written.
 const int kEqBands[] = {120, 1200, 8000};
 
-std::string number(double v, int decimals = 3) {
+std::string number(double v, int decimals = 6) {
     char buf[48];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.*f", decimals, v);
     return buf;
@@ -73,127 +75,41 @@ std::string atempoChain(double speed) {
 
 std::wstring widenAscii(const std::string& s) { return fromUtf8(s); }
 
-// A path inside a filter argument. ffmpeg's parser takes a colon as the end of
-// an option and a backslash as an escape, so a Windows path has to be handed
-// over with the slashes turned round and the drive's colon escaped. The whole
-// filter graph already sits inside double quotes on the command line, where a
-// backslash means itself, so this is the only escaping the path needs.
+// Escape both the option parser and the enclosing filtergraph parser.
 std::string filterPath(const std::wstring& path) {
-    std::string out;
+    std::string option;
     for (char c : toUtf8(path)) {
-        if (c == '\\') { out += '/'; continue; }
-        if (c == ':') { out += "\\:"; continue; }
-        if (c == '\'') { out += "\\\'"; continue; }
+        if (c == '\\') c = '/';
+        if (c == ':' || c == '\'' || c == ' ') option += '\\';
+        option += c;
+    }
+    std::string out;
+    for (char c : option) {
+        if (c == '\\' || c == '\'' || c == '[' || c == ']' || c == ',' || c == ';' || c == ' ') out += '\\';
         out += c;
     }
     return out;
 }
 
-// The whole picture chain for one piece: the panel's own settings with that
-// piece's additions on top, in the same order and by the same arithmetic the
-// player uses, so a clip looks the same in the file as it did on screen.
-std::string shiftChain(double x, double y) {
-    if (std::fabs(x) < 0.001 && std::fabs(y) < 0.001) return {};
-    // The frame is laid on a black canvas three times its size and the middle
-    // is taken back out, offset. What slid past the edge is cut off by the
-    // canvas and black takes its place - which is what moving a picture out of
-    // frame looks like, zoomed in or out.
-    std::ostringstream c;
-    c << ",pad=w=3*in_w:h=3*in_h:x=in_w:y=in_h:color=black"
-      << ",crop=w=in_w/3:h=in_h/3:x=in_w/3*(1-" << number(x, 4)
-      << "):y=in_h/3*(1-" << number(y, 4) << ")";
-    return c.str();
-}
-
-// The zoom, as a scale and a crop back to the size that came in - so the canvas
-// stays the canvas and the picture grows or shrinks inside it.
-std::string zoomChain(double z) {
-    if (std::fabs(z - 1.0) < 1e-6) return {};
-    std::ostringstream c;
-    c << ",scale=iw*" << number(z, 4) << ":ih*" << number(z, 4);
-    if (z > 1.0) {
-        c << ",crop=w=in_w/" << number(z, 4) << ":h=in_h/" << number(z, 4);
-    } else {
-        c << ",pad=w=in_w/" << number(z, 4) << ":h=in_h/" << number(z, 4)
-          << ":x=(ow-iw)/2:y=(oh-ih)/2:color=black";
-    }
-    return c.str();
-}
-
-std::string pictureChain(const RenderJob& job, const Segment& piece) {
-    const ClipVideo& v = piece.video;
-    const bool has = v.set;
-    const int contrast = job.contrast + (has ? v.contrast : 0);
-    const int brightness = job.brightness + (has ? v.brightness : 0);
-    const int saturation = job.saturation + (has ? v.saturation : 0);
-    const int gamma = job.gamma + (has ? v.gamma : 0);
-    const int hue = job.hue + (has ? v.hue : 0);
-    const int sharpen = std::max(0, std::min(200, job.sharpen + (has ? v.sharpen : 0)));
-    const int denoise = std::max(0, std::min(100, job.denoise + (has ? v.denoise : 0)));
-
-    std::ostringstream c;
-    // The portrait canvas first, because a piece's own framing is cut by it -
-    // which is the order the player shows: the canvas, then what is inside it.
-    if (job.portrait) {
-        // Which part of a wide frame the tall canvas shows. Sliding it across
-        // the source is what "move the picture in its portrait frame" means -
-        // taking the middle and then shifting it only pushed it into black.
-        const double t = std::max(0.0, std::min(1.0, 0.5 - job.panX * 0.5));
-        c << ",crop=w=ih*9/16:h=ih:x=(iw-ih*9/16)*" << number(t, 4) << ":y=0";
-    }
-    // The crop next, because it decides what the rest of the chain works on.
-    double cx = 0.0, cy = 0.0, cw = 1.0, ch = 1.0;
-    if (clipWindow(v, &cx, &cy, &cw, &ch)) {
-        c << ",crop=iw*" << number(cw, 4) << ":ih*" << number(ch, 4)
-          << ":iw*" << number(cx, 4) << ":ih*" << number(cy, 4);
-    }
-    double sx = 0.0, sy = 0.0;
-    clipShift(v, &sx, &sy);
-    c << shiftChain(sx, sy);
-    c << ",eq=contrast=" << number(1.0 + contrast / 100.0)
-      << ":brightness=" << number(brightness / 100.0)
-      << ":saturation=" << number(1.0 + saturation / 100.0)
-      << ":gamma=" << number(1.0 + gamma / 100.0);
-    if (hue != 0) c << ",hue=h=" << number(hue * 1.8, 1);
-    if (denoise > 0) {
-        const double d = denoise / 100.0;
-        c << ",hqdn3d=" << number(2.0 * d, 2) << ":" << number(1.5 * d, 2) << ":"
-          << number(4.0 * d, 2) << ":" << number(4.0 * d, 2);
-    }
-    if (sharpen > 0) {
-        // The player sharpens with a contrast-adaptive shader, which ffmpeg has
-        // no equivalent of. unsharp at a little over half the weight is the
-        // closest match that does not ring on edges.
-        c << ",unsharp=3:3:" << number(sharpen / 100.0 * 0.95, 2) << ":3:3:0";
-    }
-    if (has && v.opacity < 0.999f) {
-        c << ",colorchannelmixer=rr=" << number(v.opacity, 3) << ":gg="
-          << number(v.opacity, 3) << ":bb=" << number(v.opacity, 3);
-    }
-    return c.str();
-}
-
 // One sound track over one piece, again on top of what the mixer was doing.
-std::string clipSoundChain(const Segment& piece, int track, int sourceRate) {
-    const auto found = piece.audio.find(track);
-    if (found == piece.audio.end() || !found->second.set) return {};
-    const ClipAudio& a = found->second;
-
+std::string clipSoundChain(const Segment& piece, const RenderTrack& track) {
+    const auto found = piece.audio.find(track.editIndex);
+    const ClipAudio empty;
+    const ClipAudio& a = found != piece.audio.end() && found->second.set ? found->second : empty;
     std::ostringstream c;
-    if (std::fabs(a.gain - 1.0f) > 0.001f) {
-        c << ",volume=" << number(a.gain, 4);
-    }
-    const float bands[] = {a.eqLow, a.eqMid, a.eqHigh};
-    for (int b = 0; b < 3; ++b) {
-        if (std::fabs(bands[b]) <= 0.05f) continue;
-        c << ",equalizer=f=" << kEqBands[b] << ":t=q:w=1.2:g=" << number(bands[b], 1);
-    }
-    if (std::fabs(a.pitch) > 0.01f) {
-        const double ratio = std::pow(2.0, a.pitch / 12.0);
-        const int rate = sourceRate > 0 ? sourceRate : 48000;
-        std::string tempo = atempoChain(1.0 / ratio);
-        if (!tempo.empty()) tempo.pop_back();        // the trailing comma
-        c << ",asetrate=" << static_cast<int>(rate * ratio + 0.5);
+    if (a.silent) c << ",volume=0";
+    else if (std::fabs(a.gain-1) > .001) c << ",volume=" << number(a.gain);
+    const float bands[] = {track.eqLow+a.eqLow,track.eqMid+a.eqMid,track.eqHigh+a.eqHigh};
+    const double q[] = {.7,.9,.7};
+    for (int b=0;b<3;++b) if (std::abs(bands[b]) > .01)
+        c << ",equalizer=f=" << kEqBands[b] << ":t=q:w=" << number(q[b]) << ":g=" << number(bands[b]);
+    const double pitch = track.pitch + a.pitch;
+    if (std::abs(pitch) > .01) {
+        const int rate = track.sourceRate > 0 ? track.sourceRate : 48000;
+        const double ratio = std::pow(2.0,pitch/12.0);
+        std::string tempo = atempoChain(1.0/ratio);
+        if (!tempo.empty()) tempo.pop_back();
+        c << ",asetrate=" << static_cast<int>(rate*ratio+.5);
         if (!tempo.empty()) c << "," << tempo;
         c << ",aresample=" << rate;
     }
@@ -212,14 +128,17 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
         0, std::min<int>(preset.encoder, _countof(kEncoders) - 1))];
 
     std::vector<Segment> segs = job.segments;
-    if (segs.empty()) segs.push_back(Segment{0.0, job.duration, true, {}});
+    segs.erase(std::remove_if(segs.begin(), segs.end(), [&](Segment& s) {
+        if (!s.kept || !std::isfinite(s.start) || !std::isfinite(s.end)) return true;
+        s.start = std::max(0.0, s.start);
+        s.end = std::min(job.duration, s.end);
+        return s.end <= s.start;
+    }), segs.end());
+    if (segs.empty() || !std::isfinite(preset.speed) || preset.speed <= 0.0) return {};
 
     std::vector<const RenderTrack*> tracks;
     for (const RenderTrack& t : job.tracks) {
         if (t.include) tracks.push_back(&t);
-    }
-    if (tracks.empty()) {
-        for (const RenderTrack& t : job.tracks) tracks.push_back(&t);
     }
 
     const double speed = std::max(0.05, preset.speed);
@@ -235,78 +154,40 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
     // against the source exactly as it was while editing and a caption lying
     // across a dropped stretch loses the part that was dropped. It is the same
     // file libass was already rendering on screen.
-    const char* source = "0:v";
-    if (!job.captions.empty()) {
-        g << "[0:v]ass=filename='" << filterPath(job.captions) << "'[vsub];";
-        source = "vsub";
-    }
 
-    // Each piece is adjusted on its own before they are joined, because each
-    // piece may have been given settings of its own.
     for (size_t i = 0; i < segs.size(); ++i) {
-        const double piece = clipSpeed(segs[i].video);
-        g << "[" << source << "]trim=start=" << number(segs[i].start)
-          << ":end=" << number(segs[i].end) << ",setpts=PTS-STARTPTS";
-        // This piece plays at its own speed. The sound of every track over the
-        // same piece is stretched by the same figure below, so they still line
-        // up once the pieces are joined.
-        if (std::fabs(piece - 1.0) > 1e-6) {
-            g << ",setpts=PTS/" << number(piece, 4);
-        }
-        g << pictureChain(job, segs[i]) << "[v" << i << "];";
+        const Segment& segment = segs[i];
+        g << "[" << i << ":v:0]trim=duration=" << number(segment.end-segment.start)
+          << ",setpts=PTS-STARTPTS+" << number(segment.start) << "/TB,"
+          << pictureFilters(job, segment.video);
+        if (job.rotate == 90) g << ",transpose=1";
+        else if (job.rotate == 180) g << ",hflip,vflip";
+        else if (job.rotate == 270) g << ",transpose=2";
+        int w = job.portrait ? std::min(job.sourceWidth, job.sourceHeight*9/16) : job.sourceWidth;
+        int h = job.sourceHeight;
+        if (job.rotate == 90 || job.rotate == 270) std::swap(w,h);
+        g << framePicture(job.zoom, job.portrait ? 0.0 : std::clamp(job.panX,-1.0,1.0),
+                          std::clamp(job.panY,-1.0,1.0),w,h);
+        if (!job.captions.empty()) g << ",ass=filename=" << filterPath(job.captions);
+        g << ",setpts=(PTS-" << number(segment.start) << "/TB)/"
+          << number(clipSpeed(segment.video)*speed) << ",setsar=1,settb=AVTB[v" << i << "];";
     }
     for (size_t i = 0; i < segs.size(); ++i) g << "[v" << i << "]";
-    g << "concat=n=" << segs.size() << ":v=1:a=0[vc];[vc]";
-
-    if (std::fabs(speed - 1.0) > 1e-6) g << "setpts=PTS/" << number(speed, 6) << ",";
-    g << "null";
-    // The same shape the player was showing. The order matters and it is the
-    // order mpv uses: crop, then the flips, then the rotation.
-    if (job.flipH) g << ",hflip";
-    if (job.flipV) g << ",vflip";
-    if (job.rotate == 90) g << ",transpose=1";
-    else if (job.rotate == 180) g << ",transpose=1,transpose=1";
-    else if (job.rotate == 270) g << ",transpose=2";
-
-    // Last of all, the way mpv does it: the zoom and where the picture was
-    // dragged to, both cut off by the canvas they sit on.
-    g << zoomChain(std::max(0.25, std::min(4.0, job.zoom)));
-    g << shiftChain(job.portrait ? 0.0 : std::max(-1.0, std::min(1.0, job.panX)),
-                    std::max(-1.0, std::min(1.0, job.panY)));
-
-    if (preset.halfSize) g << ",scale=iw/2:ih/2";
-
-    // The shape and the size of the file. The picture is fitted into the frame
-    // rather than stretched or cut, and what is left over is black - the same
-    // as the canvas in the player.
+    g << "concat=n=" << segs.size() << ":v=1:a=0[vc];[vc]null";
+    if (preset.halfSize) g << ",scale=trunc(iw/4)*2:trunc(ih/4)*2";
     int outW = preset.outWidth, outH = preset.outHeight;
     if (outW <= 0 || outH <= 0) {
-        if (preset.orientation == 2) {          // portrait
-            outW = 1080; outH = 1920;
-        } else if (preset.orientation == 1) {   // landscape
-            outW = 1920; outH = 1080;
-        }
+        if (preset.orientation == 2) { outW = 1080; outH = 1920; }
+        else if (preset.orientation == 1) { outW = 1920; outH = 1080; }
     }
     if (outW > 0 && outH > 0) {
-        outW -= outW % 2;
-        outH -= outH % 2;
+        outW = std::max(2,outW/2*2); outH = std::max(2,outH/2*2);
         g << ",scale=" << outW << ":" << outH
-          << ":force_original_aspect_ratio=decrease"
+          << ":force_original_aspect_ratio=decrease:force_divisible_by=2"
           << ",pad=" << outW << ":" << outH << ":(ow-iw)/2:(oh-ih)/2:color=black";
     }
-
-    const RowFades videoFade = job.fades.empty() ? RowFades{} : job.fades[0];
-    const char* videoCurve = videoFade.curve == FadeCurve::Smooth ? "hsin" : "tri";
-    if (videoFade.in > 0.01) {
-        g << ",fade=t=in:st=0:d=" << number(videoFade.in / speed)
-          << ":curve=" << videoCurve;
-    }
-    if (videoFade.out > 0.01) {
-        g << ",fade=t=out:st="
-          << number(std::max(0.0, outTotal - videoFade.out / speed))
-          << ":d=" << number(videoFade.out / speed) << ":curve=" << videoCurve;
-    }
-    g << "[vout];";
+    g << ",scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1[vout]";
+    if (!tracks.empty()) g << ";";
 
     // ---- sound: the same cuts per track, then level, tone, speed and fades
     for (size_t j = 0; j < tracks.size(); ++j) {
@@ -317,22 +198,35 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
         const int streamIndex = t.sourceIndex;
 
         for (size_t i = 0; i < segs.size(); ++i) {
-            g << "[0:a:" << streamIndex << "]atrim=start=" << number(segs[i].start)
-              << ":end=" << number(segs[i].end) << ",asetpts=PTS-STARTPTS";
+            g << "[" << i << ":a:" << streamIndex << "]aresample=" << t.sourceRate
+              << ":async=1:first_pts=0,atrim=duration=" << number(segs[i].end-segs[i].start)
+              << ",asetpts=PTS-STARTPTS";
             if (segs[i].muted.count(t.editIndex) > 0) {
                 g << ",volume=0";
             } else {
-                g << clipSoundChain(segs[i], t.editIndex, t.sourceRate);
+                g << clipSoundChain(segs[i], t);
             }
+            const size_t fadeIndex = static_cast<size_t>(t.editIndex + 1);
+            const RowFades f = fadeIndex < job.fades.size() ? job.fades[fadeIndex] : RowFades{};
+            const char* curve = f.curve == FadeCurve::Smooth ? "hsin" : "tri";
+            g << ",asetpts=PTS-STARTPTS+" << number(segs[i].start) << "/TB";
+            if (f.in > .001) g << ",afade=t=in:st=" << number(job.fadeStart) << ":d=" << number(f.in) << ":curve=" << curve;
+            if (f.out > .001) g << ",afade=t=out:st="
+                << number(std::max(job.fadeStart,(job.fadeEnd >= 0 ? job.fadeEnd : job.duration)-f.out))
+                << ":d=" << number(f.out) << ":curve=" << curve;
+            g << ",asetpts=PTS-STARTPTS";
             const double piece = clipSpeed(segs[i].video);
             if (std::fabs(piece - 1.0) > 1e-6) {
-                std::string tempo = atempoChain(piece);
-                if (!tempo.empty()) {
-                    tempo.pop_back();               // the trailing comma
-                    g << "," << tempo;
+                if (preset.keepPitch) {
+                    std::string tempo = atempoChain(piece);
+                    if (!tempo.empty()) { tempo.pop_back(); g << "," << tempo; }
+                } else {
+                    g << ",asetrate=" << static_cast<int>(t.sourceRate*piece+.5)
+                      << ",aresample=" << t.sourceRate;
                 }
             }
-            g << "[a" << j << "_" << i << "];";
+            g << ",apad,atrim=duration=" << number((segs[i].end-segs[i].start)/piece)
+              << ",asetpts=N/SR/TB[a" << j << "_" << i << "];";
         }
         for (size_t i = 0; i < segs.size(); ++i) g << "[a" << j << "_" << i << "]";
         g << "concat=n=" << segs.size() << ":v=0:a=1[ac" << j << "];";
@@ -343,7 +237,7 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
                 // Already measured, so the correction is a fixed gain: one pass,
                 // and exactly the figure the mixer was applying while editing.
                 const double gain =
-                    std::max(0.05, std::min(4.0, std::pow(10.0, (t.target - t.measured) / 20.0)));
+                    std::pow(10.0, std::clamp<double>(t.target - t.measured, -12.0, 12.0) / 20.0);
                 chain << "volume=" << number(gain * t.volume, 4) << ",";
             } else {
                 chain << "loudnorm=I=" << number(t.target, 1) << ":TP=-1.5:LRA=11,"
@@ -351,23 +245,6 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
             }
         } else {
             chain << "volume=" << number(t.volume, 4) << ",";
-        }
-
-        const float bands[] = {t.eqLow, t.eqMid, t.eqHigh};
-        for (int b = 0; b < 3; ++b) {
-            if (std::fabs(bands[b]) <= 0.05f) continue;
-            chain << "equalizer=f=" << kEqBands[b] << ":t=q:w=1.2:g="
-                  << number(bands[b], 1) << ",";
-        }
-
-        // This track moved against the others, the way the mixer had it. The
-        // player shifts with a delay line and ffmpeg with a resampler followed
-        // by a stretch; the interval is the same, which is what was asked for.
-        if (std::fabs(t.pitch) > 0.01f) {
-            const double ratio = std::pow(2.0, t.pitch / 12.0);
-            const int rate = t.sourceRate > 0 ? t.sourceRate : 48000;
-            chain << "asetrate=" << static_cast<int>(rate * ratio + 0.5) << ","
-                  << atempoChain(1.0 / ratio) << "aresample=" << rate << ",";
         }
 
         if (std::fabs(speed - 1.0) > 1e-6) {
@@ -380,17 +257,6 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
             }
         }
 
-        const RowFades& f = job.fades.size() > j + 1 ? job.fades[j + 1] : videoFade;
-        const char* curve = f.curve == FadeCurve::Smooth ? "hsin" : "tri";
-        if (f.in > 0.01) {
-            chain << "afade=t=in:st=0:d=" << number(f.in / speed) << ":curve=" << curve
-                  << ",";
-        }
-        if (f.out > 0.01) {
-            chain << "afade=t=out:st=" << number(std::max(0.0, outTotal - f.out / speed))
-                  << ":d=" << number(f.out / speed) << ":curve=" << curve << ",";
-        }
-
         std::string body = chain.str();
         if (!body.empty()) body.pop_back();          // the trailing comma
         if (body.empty()) body = "anull";
@@ -400,7 +266,7 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
     if (tracks.size() > 1) {
         for (size_t j = 0; j < tracks.size(); ++j) g << "[af" << j << "]";
         g << "amix=inputs=" << tracks.size() << ":normalize=0[aout]";
-    } else {
+    } else if (!tracks.empty()) {
         g << "[af0]anull[aout]";
     }
 
@@ -408,10 +274,14 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
     std::wostringstream cmd;
     cmd << L"\"" << ffmpegPath() << L"\" -y -hide_banner -nostdin -nostats";
     cmd << L" -progress pipe:1";
-    if (preset.hardwareDecode && enc.gpu) cmd << L" -hwaccel cuda";
-    cmd << L" -i \"" << job.source << L"\"";
+    for (const Segment& s : segs) {
+        if (preset.hardwareDecode) cmd << L" -hwaccel auto";
+        cmd << L" -ss " << widenAscii(number(s.start)) << L" -t "
+            << widenAscii(number(s.end-s.start)) << L" -i " << quoteArgument(job.source);
+    }
     cmd << L" -filter_complex \"" << widenAscii(g.str()) << L"\"";
-    cmd << L" -map \"[vout]\" -map \"[aout]\"";
+    cmd << L" -map \"[vout]\"";
+    if (!tracks.empty()) cmd << L" -map \"[aout]\"";
     cmd << L" -c:v " << widenAscii(enc.name);
 
     const wchar_t* speedPreset =
@@ -433,8 +303,10 @@ std::wstring buildRenderCommand(const RenderJob& job, const RenderPreset& preset
             << preset.bitrate * 2 << L"k";
     }
     if (preset.fps > 0) cmd << L" -r " << preset.fps;
+    else if (job.sourceFps > 0) cmd << L" -r " << widenAscii(number(job.sourceFps));
     cmd << L" -pix_fmt yuv420p";
-    cmd << L" -c:a aac -b:a " << preset.audioBitrate << L"k -ac 2";
+    if (!tracks.empty()) cmd << L" -c:a aac -b:a " << preset.audioBitrate << L"k -ac 2 -ar 48000";
+    cmd << L" -t " << widenAscii(number(outTotal));
     cmd << L" -movflags +faststart \"" << output << L"\"";
     return cmd.str();
 }
@@ -480,10 +352,11 @@ public:
         // On by default, because the export anybody actually wants is the film
         // they were just watching. Turning it off is for the case where the
         // player was being used to inspect something rather than to set it up.
-        preset_.speed = job.speed;
-        preset_.keepPitch = job.keepPitch;
         preset_ = settings().renderPresets.empty() ? RenderPreset{}
                                                    : settings().renderPresets.front();
+        preset_.encoder = std::max(0, std::min<int>(preset_.encoder, _countof(kEncoders)-1));
+        preset_.speed = job.speed;
+        preset_.keepPitch = job.keepPitch;
         if (!settings().renderPresets.empty()) presetIndex_ = 0;
     }
 
@@ -544,9 +417,11 @@ private:
     std::atomic<bool> running_{false}, cancel_{false};
     std::atomic<int> percent_{0};
     std::atomic<bool> succeeded_{false};
-    std::wstring status_, outputPath_;
+    std::wstring status_, outputPath_, workerError_;
     int progressTop_ = 0, bottom_ = 0;
+    int scroll_ = 0;
     bool wroteFile_ = false;
+    bool closed_ = false;
     bool wasRunning_ = false;
 };
 
@@ -555,8 +430,7 @@ constexpr int kRowHeight = 34;
 
 double RenderWindow::outputSeconds() const {
     double total = 0.0;
-    for (const Segment& s : job_.segments) total += s.end - s.start;
-    if (total <= 0.0) total = job_.duration;
+    for (const Segment& s : job_.segments) total += (s.end - s.start) / clipSpeed(s.video);
     return total / std::max(0.05, preset_.speed);
 }
 
@@ -663,6 +537,8 @@ void RenderWindow::paint(HDC dc) {
     RECT client{};
     GetClientRect(window_, &client);
     fill(dc, client, kBack);
+    const int saved = SaveDC(dc);
+    SetViewportOrgEx(dc, 0, -scroll_, nullptr);
 
     const int left = 24;
     const int right = kWindowWidth - 24;
@@ -861,9 +737,16 @@ void RenderWindow::paint(HDC dc) {
     drawButton(dc, startButton_, running_.load() ? tr(L"Cancel") : L"Render\x2026",
                startButton_.has(mouse_), true, fonts_.ui);
     drawButton(dc, closeButton_, tr(L"Close"), closeButton_.has(mouse_), false, fonts_.ui);
+    RestoreDC(dc, saved);
+    if (bottom_ > client.bottom) {
+        const int length = std::max(24L, client.bottom * client.bottom / bottom_);
+        const int at = scroll_ * (client.bottom-length) / std::max(1, bottom_-static_cast<int>(client.bottom));
+        roundFill(dc, {client.right-7,at,client.right-2,at+length}, kLineHot, 2);
+    }
 }
 
 void RenderWindow::onDown(POINT p) {
+    p.y += scroll_;
     mouse_ = p;
     auto redraw = [&] { InvalidateRect(window_, nullptr, FALSE); };
 
@@ -987,8 +870,8 @@ void RenderWindow::onDown(POINT p) {
     if (noTracks_.has(p)) { for (RenderTrack& t : tracks_) t.include = false; redraw(); return; }
 
     auto fraction = [&](const Hit& h) {
-        const double span = h.r.right - h.r.left;
-        return span <= 0 ? 0.0 : std::max(0.0, std::min(1.0, (p.x - h.r.left) / span));
+        const double span = h.r.right - h.r.left - 14.0;
+        return span <= 0 ? 0.0 : std::clamp((p.x - h.r.left - 7.0) / span, 0.0, 1.0);
     };
 
     if (bitrateSlider_.has(p)) {
@@ -1033,10 +916,11 @@ void RenderWindow::onDown(POINT p) {
 }
 
 void RenderWindow::onDrag(POINT p) {
+    p.y += scroll_;
     mouse_ = p;
     auto fraction = [&](const Hit& h) {
-        const double span = h.r.right - h.r.left;
-        return span <= 0 ? 0.0 : std::max(0.0, std::min(1.0, (p.x - h.r.left) / span));
+        const double span = h.r.right - h.r.left - 14.0;
+        return span <= 0 ? 0.0 : std::clamp((p.x - h.r.left - 7.0) / span, 0.0, 1.0);
     };
     switch (drag_) {
         case Drag::Bitrate:
@@ -1126,6 +1010,18 @@ void RenderWindow::deletePreset() {
 // they were typed in - Windows does not care and neither does this.
 namespace {
 bool samePath(const std::wstring& a, const std::wstring& b) {
+    HANDLE first = CreateFileW(a.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE second = CreateFileW(b.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    BY_HANDLE_FILE_INFORMATION x{}, y{};
+    const bool identical = first != INVALID_HANDLE_VALUE && second != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandle(first, &x) && GetFileInformationByHandle(second, &y) &&
+        x.dwVolumeSerialNumber == y.dwVolumeSerialNumber &&
+        x.nFileIndexHigh == y.nFileIndexHigh && x.nFileIndexLow == y.nFileIndexLow;
+    if (first != INVALID_HANDLE_VALUE) CloseHandle(first);
+    if (second != INVALID_HANDLE_VALUE) CloseHandle(second);
+    if (identical) return true;
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
         const wchar_t x = a[i] == L'/' ? L'\\' : towlower(a[i]);
@@ -1178,33 +1074,102 @@ bool RenderWindow::chooseOutput() {
     if (!GetSaveFileNameW(&ofn)) return false;
 
     // Whatever was typed, it comes back marked and it is not the source.
-    outputPath_ = safeOutput(file);
+    const std::wstring chosen = safeOutput(file);
+    if (chosen != file && GetFileAttributesW(chosen.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        MessageBoxW(window_, (L"Replace existing export?\n" + chosen).c_str(), L"Render",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return false;
+    outputPath_ = chosen;
     wroteFile_ = false;
     InvalidateRect(window_, nullptr, FALSE);
     return true;
 }
 
 void RenderWindow::start() {
+    if (running_.load()) return;
     if (ffmpegPath().empty()) {
         status_ = tr(L"ffmpeg.exe was not found \x2013 put it next to the player");
         return;
     }
 
     if (outputPath_.empty() && !chooseOutput()) return;
-    const std::wstring cmd = buildRenderCommand(effective(), preset_, outputPath_);
+    if (samePath(outputPath_, job_.source)) {
+        status_ = L"The export must not replace the source video.";
+        return;
+    }
+    if (job_.segments.empty()) {
+        status_ = L"Nothing to render: check cuts and IN/OUT.";
+        return;
+    }
+    // Reserve a unique sibling. Only a completed encode replaces the destination.
+    const std::wstring temp = outputPath_ + L".render-" + std::to_wstring(GetCurrentProcessId())
+        + L"-" + std::to_wstring(GetTickCount64()) +
+        (outputPath_.size() >= 4 && _wcsicmp(outputPath_.c_str()+outputPath_.size()-4, L".mkv")==0 ? L".mkv" : L".mp4");
+    const std::wstring cmd = buildRenderCommand(effective(), preset_, temp);
+    if (cmd.empty()) {
+        status_ = L"Invalid render range.";
+        return;
+    }
     const double total = outputSeconds();
 
     cancel_.store(false);
     succeeded_.store(false);
     percent_.store(0);
     running_.store(true);
+    wasRunning_ = true;
+    wroteFile_ = false;
     status_ = tr(L"rendering\x2026");
 
     if (worker_.joinable()) worker_.join();
-    worker_ = std::thread([this, cmd, total] {
+    workerError_.clear();
+    const RenderJob renderJob = effective();
+    const RenderPreset renderPreset = preset_;
+    worker_ = std::thread([this, cmd, total, temp, renderJob, renderPreset] {
+        std::ofstream log(outputPath_ + L".render.log", std::ios::binary | std::ios::trunc);
+        std::wstring selectedCommand = cmd;
+        if (kEncoders[renderPreset.encoder].gpu) {
+            std::string diagnostic;
+            const std::wstring probe = quoteArgument(ffmpegPath()) +
+                L" -hide_banner -nostdin -f lavfi -i color=s=1920x1080:r=30 -frames:v 1 -c:v " +
+                widenAscii(kEncoders[renderPreset.encoder].name) + L" -f null -";
+            if (runHidden(probe, &diagnostic, 10000) != 0) {
+                RenderPreset fallback = renderPreset;
+                fallback.encoder = renderPreset.encoder == 0 ? 3 : 4;
+                fallback.speedPreset = 2;
+                fallback.hardwareDecode = false;
+                selectedCommand = buildRenderCommand(renderJob, fallback, temp);
+                workerError_ = L"GPU encoder unavailable; exported using CPU. See render log.";
+                log << "GPU probe failed; using CPU.\n" << diagnostic << "\n";
+            }
+        }
+        if (cancel_.load()) { running_.store(false); return; }
+        log << toUtf8(selectedCommand) << "\n";
+        const std::wstring graphPath = temp + L".filters";
+        struct GraphCleanup {
+            std::wstring path;
+            ~GraphCleanup() { DeleteFileW(path.c_str()); }
+        } cleanup{graphPath};
+        const std::wstring prefix = L" -filter_complex \"";
+        const size_t graphAt = selectedCommand.find(prefix);
+        const size_t graphEnd = selectedCommand.find(L"\" -map ", graphAt + prefix.size());
+        if (graphAt != std::wstring::npos && graphEnd != std::wstring::npos) {
+            std::ofstream graph(graphPath, std::ios::binary | std::ios::trunc);
+            graph << toUtf8(selectedCommand.substr(graphAt + prefix.size(), graphEnd - graphAt - prefix.size()));
+            graph.close();
+            if (!graph) {
+                workerError_ = L"Cannot write the render filter file.";
+                running_.store(false); return;
+            }
+            selectedCommand.replace(graphAt, graphEnd + 1 - graphAt,
+                                    L" -filter_complex_script " + quoteArgument(graphPath));
+        }
+        if (selectedCommand.size() >= 32767) {
+            workerError_ = L"Too many cuts for one export. Reduce the number of pieces.";
+            running_.store(false); return;
+        }
         SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
         HANDLE readEnd = nullptr, writeEnd = nullptr;
         if (!CreatePipe(&readEnd, &writeEnd, &sa, 1 << 16)) {
+            workerError_ = L"Cannot create render pipe.";
             running_.store(false);
             return;
         }
@@ -1217,7 +1182,7 @@ void RenderWindow::start() {
         si.hStdOutput = writeEnd;
         si.hStdError = writeEnd;
 
-        std::wstring line = cmd;
+        std::wstring line = selectedCommand;
         PROCESS_INFORMATION pi{};
         const BOOL started =
             CreateProcessW(nullptr, &line[0], nullptr, nullptr, TRUE,
@@ -1225,6 +1190,7 @@ void RenderWindow::start() {
                            nullptr, &si, &pi);
         CloseHandle(writeEnd);
         if (!started) {
+            workerError_ = L"Cannot start ffmpeg (Windows error " + std::to_wstring(GetLastError()) + L").";
             CloseHandle(readEnd);
             running_.store(false);
             return;
@@ -1234,24 +1200,37 @@ void RenderWindow::start() {
         // output length is an honest percentage, where parsing the human log
         // would break the first time ffmpeg reworded it.
         std::string pending;
+        bool renderedFrame = false;
         char buffer[4096];
         DWORD got = 0;
-        while (ReadFile(readEnd, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
+        for (;;) {
             if (cancel_.load()) {
                 TerminateProcess(pi.hProcess, 1);
                 break;
             }
+            DWORD available = 0;
+            if (!PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr)) break;
+            if (!available) {
+                if (WaitForSingleObject(pi.hProcess, 25) == WAIT_OBJECT_0) {
+                    if (!PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) || !available) break;
+                }
+                continue;
+            }
+            if (!ReadFile(readEnd, buffer, std::min<DWORD>(sizeof(buffer), available), &got, nullptr) || !got) break;
+            log.write(buffer, got);
             pending.append(buffer, got);
             size_t at;
             while ((at = pending.find('\n')) != std::string::npos) {
                 const std::string entry = pending.substr(0, at);
                 pending.erase(0, at + 1);
+                if (entry.compare(0, 6, "frame=") == 0 && atoll(entry.c_str() + 6) > 0) renderedFrame = true;
                 if (entry.compare(0, 12, "out_time_us=") == 0 && total > 0.0) {
                     const double seconds = atof(entry.c_str() + 12) / 1e6;
-                    percent_.store(std::max(0, std::min(100, static_cast<int>(
+                    percent_.store(std::max(0, std::min(99, static_cast<int>(
                                                                 seconds / total * 100.0))));
                 }
             }
+            if (pending.size() > 65536) pending.erase(0, pending.size()-65536);
         }
         CloseHandle(readEnd);
 
@@ -1261,7 +1240,18 @@ void RenderWindow::start() {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
 
-        succeeded_.store(code == 0 && !cancel_.load());
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        bool ok = code == 0 && renderedFrame && !cancel_.load() &&
+            GetFileAttributesExW(temp.c_str(), GetFileExInfoStandard, &data) &&
+            (data.nFileSizeHigh || data.nFileSizeLow);
+        if (ok) {
+            ok = MoveFileExW(temp.c_str(), outputPath_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            if (!ok) workerError_ = L"Cannot save the completed export. It remains at: " + temp;
+        } else {
+            DeleteFileW(temp.c_str());
+            workerError_ = L"Render failed. Details: " + outputPath_ + L".render.log";
+        }
+        succeeded_.store(ok);
         if (succeeded_.load()) percent_.store(100);
         running_.store(false);
     });
@@ -1281,10 +1271,11 @@ void RenderWindow::tick() {
         if (succeeded_.load()) {
             wroteFile_ = true;
             status_ = tr(L"done: ") + outputPath_;
+            if (!workerError_.empty()) status_ += L" — " + workerError_;
         } else if (cancel_.load()) {
             status_ = tr(L"cancelled");
         } else {
-            status_ = tr(L"the render failed \x2013 try another codec, or copy the command and run it");
+            status_ = workerError_;
         }
     }
     wasRunning_ = now;
@@ -1330,26 +1321,48 @@ LRESULT CALLBACK RenderWindow::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
             return 0;
         case WM_MOUSEMOVE:
             if (self) {
-                self->mouse_ = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-                if (self->drag_ != Drag::None) self->onDrag(self->mouse_);
+                POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                self->mouse_ = {p.x,p.y+self->scroll_};
+                if (self->drag_ != Drag::None) self->onDrag(p);
                 else InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (self && self->drag_ == Drag::None) {
+                RECT client{}; GetClientRect(hwnd,&client);
+                self->scroll_ = std::clamp(self->scroll_ - GET_WHEEL_DELTA_WPARAM(w)*60/WHEEL_DELTA,
+                                           0,std::max(0,self->bottom_-static_cast<int>(client.bottom)));
+                self->mouse_ = {-1,-1};
+                InvalidateRect(hwnd,nullptr,FALSE);
             }
             return 0;
         case WM_LBUTTONUP:
             if (self) { self->drag_ = Drag::None; self->dragIndex_ = -1; ReleaseCapture(); }
             return 0;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            if (self) { self->drag_ = Drag::None; self->dragIndex_ = -1; }
+            if (message == WM_CANCELMODE && GetCapture() == hwnd) ReleaseCapture();
+            return 0;
         case WM_TIMER:
             if (self) self->tick();
             return 0;
         case WM_KEYDOWN:
-            if (w == VK_ESCAPE) DestroyWindow(hwnd);
+            if (w == VK_ESCAPE) SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            else if (self && (w == VK_NEXT || w == VK_PRIOR || w == VK_END || w == VK_HOME)) {
+                RECT client{}; GetClientRect(hwnd,&client);
+                const int limit = std::max(0,self->bottom_-static_cast<int>(client.bottom));
+                self->scroll_ = w == VK_END ? limit : (w == VK_HOME ? 0 :
+                    std::clamp(self->scroll_ + (w == VK_NEXT ? 1 : -1)*static_cast<int>(client.bottom)*3/4,0,limit));
+                InvalidateRect(hwnd,nullptr,FALSE);
+            }
             return 0;
         case WM_CLOSE:
             if (self && self->running_.load()) { self->stop(); return 0; }
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
-            PostQuitMessage(0);
+            if (self) self->closed_ = true;
             return 0;
         default: break;
     }
@@ -1376,12 +1389,16 @@ bool RenderWindow::run(HWND owner, HINSTANCE instance) {
     RECT ownerRect{};
     GetWindowRect(owner, &ownerRect);
     const int width = frame.right - frame.left;
-    const int height = frame.bottom - frame.top;
+    MONITORINFO monitor{sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromWindow(owner,MONITOR_DEFAULTTONEAREST),&monitor);
+    const RECT work = monitor.rcWork;
+    const int height = std::min(static_cast<int>(frame.bottom-frame.top),
+                                std::max(320,static_cast<int>(work.bottom-work.top)-24));
 
     window_ = CreateWindowExW(WS_EX_DLGMODALFRAME, cls.lpszClassName, L"Render",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                              (ownerRect.left + ownerRect.right - width) / 2,
-                              std::max<LONG>(40, (ownerRect.top + ownerRect.bottom - height) / 2),
+                              std::clamp<LONG>((ownerRect.left+ownerRect.right-width)/2,work.left,std::max(work.left,work.right-width)),
+                              std::clamp<LONG>((ownerRect.top+ownerRect.bottom-height)/2,work.top,std::max(work.top,work.bottom-height)),
                               width, height, owner, nullptr, instance, this);
     if (!window_) { fonts_.destroy(); return false; }
 
@@ -1389,13 +1406,14 @@ bool RenderWindow::run(HWND owner, HINSTANCE instance) {
     ShowWindow(window_, SW_SHOW);
     SetTimer(window_, 1, 120, nullptr);
 
-    MSG message;
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+    MSG message{};
+    while (!closed_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(window_, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
 
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);

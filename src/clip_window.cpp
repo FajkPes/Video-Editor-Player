@@ -164,6 +164,15 @@ void Sheet::layout() {
     cancel_.r = {right - 104, bar, right, bar + 32};
     save_.r = {right - 216, bar, right - 112, bar + 32};
     extra_.r = {left, bar, left + 150, bar + 32};
+    if (edit_) {
+        SetWindowPos(edit_, nullptr, left, textTop_, width_ - 48, textHeight_,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        RECT visible{0, std::max(0, (subtitle_.empty() ? 72 : 92) - textTop_),
+                      width_ - 48, std::min(textHeight_, bar - 14 - textTop_)};
+        if (visible.bottom < visible.top) visible.bottom = visible.top;
+        HRGN region = CreateRectRgnIndirect(&visible);
+        if (region && !SetWindowRgn(edit_, region, TRUE)) DeleteObject(region);
+    }
 }
 
 void Sheet::scrollBy(int by) { scrollTo(scroll_ + by); }
@@ -173,6 +182,7 @@ void Sheet::scrollTo(int top) {
     const int want = std::max(0, std::min(most, top));
     if (want == scroll_) return;
     scroll_ = want;
+    layout();
     InvalidateRect(window_, nullptr, FALSE);
 }
 
@@ -193,6 +203,8 @@ void Sheet::paint(HDC dc) {
              DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS, fonts_.sub);
     }
 
+    const int bodyState = SaveDC(dc);
+    IntersectClipRect(dc, 0, subtitle_.empty() ? 72 : 92, client.right, save_.r.top - 14);
     for (const Row& row : rows_) {
         if (row.kind == Kind::Gap) continue;
         if (row.kind == Kind::Heading) {
@@ -290,6 +302,7 @@ void Sheet::paint(HDC dc) {
         }
     }
 
+    RestoreDC(dc, bodyState);
     auto button = [&](const Hit& h, const std::wstring& label, bool primary) {
         roundBox(dc, h.r,
                  primary ? (h.has(mouse_) ? kAccentDk : kAccent)
@@ -370,6 +383,7 @@ void Sheet::onDown(POINT p) {
         DestroyWindow(window_);
         return;
     }
+    if (p.y < (subtitle_.empty() ? 72 : 92) || p.y >= save_.r.top - 14) return;
 
     for (size_t i = 0; i < rows_.size(); ++i) {
         Row& row = rows_[i];
@@ -486,6 +500,11 @@ LRESULT CALLBACK Sheet::proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
                 ReleaseCapture();
             }
             return 0;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            if (self) { self->dragRow_ = -1; self->draggingBar_ = false; }
+            if (message == WM_CANCELMODE && GetCapture() == hwnd) ReleaseCapture();
+            return 0;
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) DestroyWindow(hwnd);
             return 0;
@@ -539,7 +558,7 @@ bool Sheet::run(HWND owner, HINSTANCE instance) {
     left = std::max(work.left, std::min(work.right - width, left));
     top = std::max(work.top, std::min(work.bottom - height, top));
     window_ = CreateWindowExW(WS_EX_DLGMODALFRAME, cls.lpszClassName, title_.c_str(),
-                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
                               left, top, width, height, owner, nullptr, instance, this);
     if (!window_) { fonts_.destroy(); return false; }
 
@@ -562,13 +581,14 @@ bool Sheet::run(HWND owner, HINSTANCE instance) {
     // the player behind - and the rows here never move.
     if (!edit_) SetFocus(window_);
 
-    MSG message;
+    MSG message{};
     while (!closed_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(window_, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
 
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);

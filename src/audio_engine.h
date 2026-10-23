@@ -29,6 +29,7 @@
 #include <vector>
 
 namespace vp {
+struct Segment;
 
 // The format everything is converted to on the way in. Chosen once, so nothing
 // downstream ever has to ask what it is holding.
@@ -104,6 +105,7 @@ struct TrackControls {
     std::atomic<float> clipEqMid{0.0f};
     std::atomic<float> clipEqHigh{0.0f};
     std::atomic<float> clipPitch{0.0f};
+    std::atomic<float> normaliseReference{-70.0f}; // completed source loudness measurement
     std::atomic<bool> clipSilent{false};
 
     // What the normaliser is doing to this track right now, in dB, so the
@@ -172,6 +174,7 @@ public:
     // time (a voice keeps its pitch) and resampling (a voice goes up, the way a
     // tape does).
     void setSpeed(double s);
+    void setClipEdits(const std::vector<Segment>& segments);
     double speed() const { return speed_.load(std::memory_order_relaxed); }
     void setKeepPitch(bool on);
     bool keepPitch() const { return keepPitch_.load(std::memory_order_relaxed); }
@@ -213,12 +216,14 @@ public:
     std::string continuityReport() const;
 
 private:
+    friend struct AudioSemanticProbe;
     bool startOutput(std::string* error);
     void decodeLoop();
     void renderLoop();
     // Returns how many frames it actually produced: zero when a track has not
     // been decoded far enough yet and the clock has to wait.
     int64_t mixBlock(float* out, int64_t frames);
+    int64_t mixChunk(float* out, int64_t frames, const Segment* segment, bool scheduled);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

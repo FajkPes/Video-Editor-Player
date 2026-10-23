@@ -60,8 +60,8 @@ std::string AudioEngine::continuityReport() const {
 }
 
 double AudioEngine::position() const {
-    const int64_t pos = impl_->playPos.load(std::memory_order_relaxed);
-    const double seconds = static_cast<double>(pos) / kMixRate - outputLatency_;
+    const double seconds = impl_->outputPosition.load(std::memory_order_relaxed) -
+        impl_->queuedSeconds.load(std::memory_order_relaxed);
     return seconds < 0.0 ? 0.0 : seconds;
 }
 
@@ -69,7 +69,7 @@ void AudioEngine::play() { playing_.store(true, std::memory_order_relaxed); }
 void AudioEngine::pause() { playing_.store(false, std::memory_order_relaxed); }
 
 void AudioEngine::setSpeed(double s) {
-    s = s < 0.25 ? 0.25 : (s > 4.0 ? 4.0 : s);
+    s = std::isfinite(s) ? std::clamp(s, 0.025, 16.0) : 1.0;
     speed_.store(s, std::memory_order_relaxed);
 }
 
@@ -77,10 +77,32 @@ void AudioEngine::setKeepPitch(bool on) {
     keepPitch_.store(on, std::memory_order_relaxed);
 }
 
+void AudioEngine::setClipEdits(const std::vector<Segment>& segments) {
+    const auto previous = std::atomic_load(&impl_->clipEdits);
+    auto equal = [](const ClipAudio& a, const ClipAudio& b) {
+        return a.set == b.set && a.gain == b.gain && a.eqLow == b.eqLow &&
+            a.eqMid == b.eqMid && a.eqHigh == b.eqHigh && a.pitch == b.pitch && a.silent == b.silent;
+    };
+    bool same = previous && previous->size() == segments.size();
+    for (size_t i=0;same && i<segments.size();++i) {
+        const auto& a=(*previous)[i]; const auto& b=segments[i];
+        same = a.start==b.start && a.end==b.end && a.muted==b.muted && a.audio.size()==b.audio.size();
+        auto x=a.audio.begin(), y=b.audio.begin();
+        for (;same && x!=a.audio.end();++x,++y) same=x->first==y->first && equal(x->second,y->second);
+    }
+    if (!same) {
+        std::shared_ptr<const std::vector<Segment>> next = std::make_shared<std::vector<Segment>>(segments);
+        std::atomic_store(&impl_->clipEdits,next);
+    }
+}
+
 void AudioEngine::seek(double seconds) {
+    std::lock_guard<std::mutex> lock(impl_->renderMutex);
     if (seconds < 0.0) seconds = 0.0;
     const int64_t frame = static_cast<int64_t>(seconds * kMixRate);
     impl_->playPos.store(frame, std::memory_order_relaxed);
+    impl_->outputPosition.store(seconds, std::memory_order_relaxed);
+    impl_->queuedSeconds.store(0.0, std::memory_order_relaxed);
     impl_->seekRequest.store(frame, std::memory_order_release);
     impl_->flushSpeed.store(true, std::memory_order_release);
 }
@@ -109,6 +131,7 @@ bool AudioEngine::open(const std::wstring& path, std::string* error) {
     // Media Foundation inserts whatever decoder and resampler each stream needs
     // to reach it, so nothing downstream ever has to ask what the file held.
     int audioSeen = 0;
+    bool hasVideo = false;
     for (DWORD i = 0;; ++i) {
         ComPtr<IMFMediaType> native;
         hr = impl_->reader->GetNativeMediaType(i, 0, &native);
@@ -116,7 +139,9 @@ bool AudioEngine::open(const std::wstring& path, std::string* error) {
         if (FAILED(hr)) continue;
 
         GUID major{};
-        if (FAILED(native->GetMajorType(&major)) || major != MFMediaType_Audio) continue;
+        if (FAILED(native->GetMajorType(&major))) continue;
+        if (major == MFMediaType_Video) hasVideo = true;
+        if (major != MFMediaType_Audio) continue;
 
         // Counted before anything can go wrong with it, so a stream that will
         // not decode still uses up its number - which is what ffmpeg will do.
@@ -176,7 +201,7 @@ bool AudioEngine::open(const std::wstring& path, std::string* error) {
         controls_.push_back(std::make_unique<TrackControls>());
     }
 
-    if (tracks_.empty()) {
+    if (tracks_.empty() && !hasVideo) {
         if (error) *error = "the file has no audio track this machine can decode";
         impl_->reader.Reset();
         return false;
@@ -212,7 +237,8 @@ bool AudioEngine::open(const std::wstring& path, std::string* error) {
     }
 
     impl_->decodeStop.store(false);
-    impl_->decodeThread = std::thread([this] { decodeLoop(); });
+    if (!tracks_.empty()) impl_->decodeThread = std::thread([this] { decodeLoop(); });
+    else impl_->eof.store(true);
     return true;
 }
 
@@ -233,11 +259,21 @@ void AudioEngine::close() {
     controls_.clear();
     duration_ = 0.0;
     impl_->playPos.store(0);
+    impl_->outputPosition.store(0);
+    impl_->queuedSeconds.store(0);
+    impl_->seekRequest.store(-1);
+    impl_->speedChanger.reset();
+    std::atomic_store(&impl_->clipEdits, std::shared_ptr<const std::vector<Segment>>{});
+    impl_->equalisers.clear(); impl_->shifters.clear(); impl_->meters.clear();
+    impl_->eqSetting.clear(); impl_->pitchSetting.clear();
+    if (impl_->mixFormat) { CoTaskMemFree(impl_->mixFormat); impl_->mixFormat = nullptr; }
+    if (impl_->bufferEvent) { CloseHandle(impl_->bufferEvent); impl_->bufferEvent = nullptr; }
     impl_->eof.store(false);
     playing_.store(false);
 }
 
 void AudioEngine::decodeLoop() {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     // Below normal on purpose. This thread may stall on a disk; the one that
     // must never stall is the renderer, and giving them equal standing is how a
     // slow read turns into a hole in the sound.
@@ -263,7 +299,8 @@ void AudioEngine::decodeLoop() {
         // only mean throwing more of it away at the next seek.
         const int64_t pos = impl_->playPos.load(std::memory_order_relaxed);
         int64_t least = INT64_MAX;
-        for (auto& b : impl_->buffers) least = std::min(least, b->available(pos));
+        for (auto& b : impl_->buffers) if (!b->finished.load(std::memory_order_relaxed))
+            least = std::min(least, b->available(pos));
         if (least > kMixRate * 2 || impl_->eof.load(std::memory_order_relaxed)) {
             Sleep(5);
             continue;
@@ -277,8 +314,11 @@ void AudioEngine::decodeLoop() {
             &stream, &flags, &timestamp, &sample);
         if (FAILED(hr)) { Sleep(5); continue; }
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            impl_->eof.store(true, std::memory_order_relaxed);
-            continue;
+            for (size_t i=0;i<impl_->streamIndex.size();++i)
+                if (impl_->streamIndex[i]==stream) impl_->buffers[i]->finished.store(true,std::memory_order_relaxed);
+            const bool all = std::all_of(impl_->buffers.begin(),impl_->buffers.end(),
+                [](const auto& buffer) { return buffer->finished.load(std::memory_order_relaxed); });
+            impl_->eof.store(all, std::memory_order_relaxed);
         }
         if (!sample) continue;
 
@@ -304,6 +344,7 @@ void AudioEngine::decodeLoop() {
         }
         buffer->Unlock();
     }
+    if (SUCCEEDED(com)) CoUninitialize();
 }
 
 }  // namespace vp

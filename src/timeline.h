@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "media_tools.h"
@@ -56,6 +57,14 @@ struct ClipVideo {
     double zoom = 1.0;               // 1 as shot, 2 twice as close
     double speed = 1.0;              // this stretch alone, on top of the player
 };
+
+inline bool sameClipVideo(const ClipVideo& a, const ClipVideo& b) {
+    auto fields=[](const ClipVideo& v) {
+        return std::tie(v.set,v.opacity,v.contrast,v.brightness,v.saturation,v.gamma,v.hue,
+                        v.sharpen,v.denoise,v.cropX,v.cropY,v.cropW,v.cropH,v.panX,v.panY,v.zoom,v.speed);
+    };
+    return fields(a)==fields(b);
+}
 
 // The crop, the zoom and the pan of one clip fold down into a single window
 // over the frame, which is what both the player and the export then cut out.
@@ -292,7 +301,11 @@ public:
     std::string assDocument(int frameWidth, int frameHeight) const;
 
     // -------------------------------------------------------------- screen
-    void setBounds(const RECT& r) { bounds_ = r; }
+    void setBounds(const RECT& r) { bounds_ = r; scrollRows(0); }
+    void scrollRows(int pixels) {
+        scrollY_ = std::clamp(scrollY_ + pixels, 0,
+                              std::max(0, heightFor() - static_cast<int>(bounds_.bottom - bounds_.top)));
+    }
     const RECT& bounds() const { return bounds_; }
 
     void paint(HDC dc, double playhead, POINT mouse, const theme::Fonts* fonts) const;
@@ -322,8 +335,8 @@ public:
     std::wstring statusLine() const;
 
 private:
-    int textTop() const { return bounds_.top + kHeadHeight; }
-    int trackStart() const { return bounds_.top + kHeadHeight + kTextRow + kGap; }
+    int textTop() const { return bounds_.top + kHeadHeight - scrollY_; }
+    int trackStart() const { return textTop() + kTextRow + kGap; }
     int rowTop(int row) const;
     int rowHeight(int row) const;
     int bodyLeft() const { return bounds_.left + kGutter; }
@@ -359,6 +372,7 @@ private:
     int selectedText_ = -1;
 
     RECT bounds_{};
+    int scrollY_ = 0;
 };
 
 }  // namespace vp
