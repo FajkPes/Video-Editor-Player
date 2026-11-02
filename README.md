@@ -26,6 +26,10 @@ The source builds with Visual Studio C++ tools and the Windows SDK; see [TESTING
 
 [Detailed documentation](README-DETAILS.md) · [All releases](https://github.com/FajkPes/Video-Editor-Player/releases)
 
+## Audio tracks and editing
+
+Open a video to inspect its tracks and timeline. Individual tracks can be muted or given their own gain, and the export can combine the selected audio. Clip-level controls allow changes such as gain, speed and pitch alongside picture effects and subtitles. This makes the app useful for managing a multi-track recording as well as for everyday playback and short edits. Live playback and FFmpeg export use different audio-processing implementations, so matching settings do not mean sample-identical output.
+
 ## Credits
 
 **Idea, concept and design:** FajkPes  
