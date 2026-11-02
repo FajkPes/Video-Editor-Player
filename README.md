@@ -25,3 +25,8 @@ The package includes libmpv, FFmpeg and FFprobe. Keep them with the application.
 The source builds with Visual Studio C++ tools and the Windows SDK; see [TESTING.md](TESTING.md) for build and regression-test details.
 
 [Detailed documentation](README-DETAILS.md) · [All releases](https://github.com/FajkPes/Video-Editor-Player/releases)
+
+## Credits
+
+**Idea, concept and design:** FajkPes  
+**Coding:** ChatGPT Codex, Claude and Google Antigravity
