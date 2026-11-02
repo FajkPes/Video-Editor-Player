@@ -1,13 +1,15 @@
-# Video Editor Player — Windows C++
+# Video Editor Player
 
-Aktuální zdrojový kód a přenosná Windows x64 sestava z 23. října 2026.
+A Windows video player and editor built to make working with multiple audio tracks easier.
 
-Stáhněte ZIP z [nejnovějšího vydání](https://github.com/FajkPes/Video-Editor-Player/releases/latest), rozbalte celou složku a spusťte **Start Video Editor Player.bat**. Balík obsahuje aplikaci, libmpv, FFmpeg, FFprobe a český překlad. Nepotřebuje Python ani překladač.
+## Key features
 
-Přehrávač podporuje časovou osu, střihy, obrazové úpravy, titulky, zvukové stopy a export přes FFmpeg. Testované chování a omezení popisuje [TESTING.md](TESTING.md). Osobní nastavení, rozpracované projekty a testovací média nejsou součástí vydání.
+- Mix, mute and normalize individual audio tracks.
+- Trim clips, adjust speed and pitch, and add captions.
+- Preview changes and export with FFmpeg.
 
-## Sestavení
+## Get started
 
-Na Windows s Visual Studio C++ Build Tools a Windows SDK spusťte `build.bat`. Výstup je `build/VideoPlayer.exe`. Vedle něj umístěte `libmpv-2.dll`, `ffmpeg.exe` a `ffprobe.exe` z vydání; překlady patří do `build/lang`. Spouštějte `Video Player.bat` nebo `Start Video Editor Player.bat`.
+Download the ZIP from Releases, extract it, and run `Start Video Editor Player.bat`.
 
-Datum označuje tento publikační snímek; původní vydání v1.0.0 zůstává dostupné. Licence aplikace je GPL-3.0-or-later, podrobnosti v [LICENSE](LICENSE) a [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Download a release](https://github.com/FajkPes/Video-Editor-Player/releases) · [Detailed documentation](README-DETAILS.md)
